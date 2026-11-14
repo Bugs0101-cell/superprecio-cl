@@ -1,0 +1,21 @@
+{
+  "name": "comparador-supermercados-cl",
+  "version": "1.0.0",
+  "description": "Comparador automático de precios y precio por unidad (kg, L, 100g, 100ml) con historial de variabilidad para supermercados de Chile (Jumbo, Santa Isabel, Unimarc, Tottus, Lider)",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node src/test-live.mjs"
+  },
+  "keywords": [
+    "supermercados",
+    "chile",
+    "precios",
+    "jumbo",
+    "unimarc",
+    "tottus",
+    "santaisabel",
+    "lider"
+  ],
+  "license": "MIT"
+}
