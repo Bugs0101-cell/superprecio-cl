@@ -1,0 +1,906 @@
+<!DOCTYPE html>
+<html lang="es-CL">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SuperPrecio CL — Comparador Inteligente de Supermercados, Carritos y $/Unidad</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.4/dist/chart.umd.min.js"></script>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="container topbar-inner">
+      <div class="brand">
+        <div class="brand-logo">🛒</div>
+        <div>
+          <h1>SuperPrecio <span>CL</span></h1>
+          <p class="subtitle">Comparador automático de precios por unidad (kg, L, 10g proteína), carritos de compra, fricción de despacho e IPC</p>
+        </div>
+      </div>
+
+      <div class="topbar-actions">
+        <div class="scheduler-box" title="Frecuencia con la que el servidor consulta y guarda los precios automáticamente">
+          <span class="pulse-dot"></span>
+          <label for="autoIntervalSelect">Auto-Registro:</label>
+          <select id="autoIntervalSelect">
+            <option value="60">Cada 1 hora</option>
+            <option value="180">Cada 3 horas</option>
+            <option value="360">Cada 6 horas</option>
+            <option value="720">Cada 12 horas</option>
+            <option value="1440">Cada 24 horas</option>
+            <option value="0">Solo manual</option>
+          </select>
+        </div>
+
+        <button id="btnRefreshAll" class="btn btn-primary">
+          <span class="icon">🔄</span> Actualizar Todos Ahora
+        </button>
+
+        <a href="/api/export.csv" class="btn btn-secondary" download>
+          <span class="icon">📥</span> Exportar CSV / Excel
+        </a>
+
+        <button id="btnLogout" class="btn btn-secondary" style="display:none;" title="Cerrar sesión">
+          🔒 Salir
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="container main-content">
+    <!-- KPIs Superiores -->
+    <section class="kpi-grid" id="kpiSection">
+      <div class="kpi-card">
+        <div class="kpi-label">Productos Monitoreados</div>
+        <div class="kpi-value" id="kpiTotalTracked">—</div>
+        <div class="kpi-sub" id="kpiTotalSnapshots">Cargando historial...</div>
+      </div>
+      <div class="kpi-card highlight-green">
+        <div class="kpi-label">Mejor Supermercado para tu Carrito</div>
+        <div class="kpi-value" id="kpiMaxSavings">—</div>
+        <div class="kpi-sub" id="kpiSavingsSub">Calculando carrito activo...</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Líder en Mejor $/Unidad Hoy</div>
+        <div class="kpi-value" id="kpiBestStore">—</div>
+        <div class="kpi-sub" id="kpiBestStoreSub">Según productos con menor $/kg o $/L</div>
+      </div>
+      <div class="kpi-card">
+        <div class="kpi-label">Escala de Visualización</div>
+        <div class="kpi-scale-selector">
+          <select id="globalUnitScale" class="scale-select">
+            <option value="base">Base: $/kg · $/L · $/un</option>
+            <option value="per100">Por 100: $/100g · $/100ml</option>
+            <option value="small">Por 1: $/g · $/ml</option>
+            <option value="protein">🥩 Nutricional: $/10g Proteína</option>
+          </select>
+        </div>
+        <div class="kpi-sub" id="kpiLastCheck">Último chequeo: —</div>
+      </div>
+    </section>
+
+    <!-- Navegación de Pestañas -->
+    <nav class="tabs-nav">
+      <button class="tab-btn active" data-tab="tab-dashboard">
+        📊 Seguimiento y Semáforo (<span id="badgeTrackedCount">0</span>)
+      </button>
+      <button class="tab-btn" data-tab="tab-basket">
+        🛒 Carrito Inteligente y Fricción (<span id="badgeCartItemsCount">0</span>)
+      </button>
+      <button class="tab-btn" data-tab="tab-search">
+        🔍 Buscador en Vivo y Falsos Packs
+      </button>
+      <button class="tab-btn" data-tab="tab-ipc">
+        📈 IPC Personal e Inflación
+      </button>
+      <button class="tab-btn" data-tab="tab-links">
+        ⚡ Bookmarklet 1-Clic, Lider y Telegram
+      </button>
+    </nav>
+
+    <!-- TAB 1: DASHBOARD DE SEGUIMIENTO Y VARIABILIDAD -->
+    <section id="tab-dashboard" class="tab-panel active">
+      <div class="panel-header-bar">
+        <div>
+          <h2>Productos en Seguimiento Automático y Semáforo de Precios</h2>
+          <p>Compara en tiempo real qué supermercado tiene el menor precio por unidad (kg, L, 10g proteína), detecta <strong>Pisos Históricos (🟢)</strong>, <strong>Ofertas Infladas (🔴)</strong> y cambios de gramaje (Reduflación).</p>
+        </div>
+        <button id="btnOpenNewTrackModal" class="btn btn-accent">
+          ➕ Nuevo Producto a Seguir
+        </button>
+      </div>
+
+      <!-- Tarjetas de Productos Seguidos -->
+      <div id="trackedItemsGrid" class="tracked-grid">
+        <div class="loading-state">Cargando productos y precios en vivo...</div>
+      </div>
+
+      <!-- Sección de Análisis de Variabilidad e Historial -->
+      <div class="history-section card" id="historySection">
+        <div class="history-header">
+          <div>
+            <span class="section-tag">📈 ANÁLISIS DE VARIABILIDAD HISTÓRICA</span>
+            <h3 id="historyTitle">Selecciona un producto para ver su evolución</h3>
+          </div>
+          <div class="history-controls">
+            <label for="historyProductSelect">Producto:</label>
+            <select id="historyProductSelect"></select>
+
+            <div class="btn-group">
+              <button class="btn btn-sm active" id="btnChartModeUnit" data-mode="unit">
+                Precio por Unidad ($/kg · $/L)
+              </button>
+              <button class="btn btn-sm" id="btnChartModeTotal" data-mode="total">
+                Precio Total ($)
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="history-body">
+          <div class="chart-container">
+            <canvas id="priceHistoryChart"></canvas>
+          </div>
+
+          <div class="variability-stats-wrap">
+            <h4>Estadísticas de Variabilidad y Semáforo por Supermercado</h4>
+            <div class="table-responsive">
+              <table class="data-table" id="variabilityStatsTable">
+                <thead>
+                  <tr>
+                    <th>Supermercado</th>
+                    <th>Semáforo "¿Compro hoy?"</th>
+                    <th>Precio Actual / Unidad</th>
+                    <th>Mínimo Histórico</th>
+                    <th>Máximo Histórico</th>
+                    <th>Promedio</th>
+                    <th>Volatilidad (%)</th>
+                    <th>Variación vs Anterior</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <details class="snapshots-log-details">
+          <summary>📋 Ver Registro Detallado de Mediciones Guardadas (<span id="snapshotCountLabel">0</span> registros)</summary>
+          <div class="table-responsive">
+            <table class="data-table" id="snapshotsLogTable">
+              <thead>
+                <tr>
+                  <th>Fecha y Hora</th>
+                  <th>Supermercado</th>
+                  <th>Producto</th>
+                  <th>Formato</th>
+                  <th>Precio Total</th>
+                  <th>Precio / Unidad</th>
+                  <th>$/100g o 100ml</th>
+                  <th>Oferta / Promo</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </details>
+      </div>
+    </section>
+
+    <!-- TAB 2: GENERADOR Y COMPARADOR DE CARRITOS DE COMPRA -->
+    <section id="tab-basket" class="tab-panel">
+      <!-- Barra superior de gestión de carritos -->
+      <div class="cart-toolbar card">
+        <div class="cart-toolbar-left">
+          <div class="filter-group">
+            <label for="activeCartSelect"><strong>🛒 Carrito Activo:</strong></label>
+            <select id="activeCartSelect" class="cart-select-main"></select>
+          </div>
+          <button type="button" id="btnNewCartModal" class="btn btn-secondary btn-sm">
+            ➕ Nuevo Carrito
+          </button>
+          <button type="button" id="btnDeleteCart" class="btn btn-danger-ghost btn-sm" title="Eliminar este carrito">
+            🗑️ Eliminar Carrito
+          </button>
+        </div>
+
+        <div class="cart-toolbar-right">
+          <div class="filter-group">
+            <label for="cartCriteriaSelect">Criterio:</label>
+            <select id="cartCriteriaSelect">
+              <option value="unit_price">🏆 Mejor $/Unidad (kg, L)</option>
+              <option value="total_price">💰 Envase Más Barato ($)</option>
+            </select>
+          </div>
+          <button type="button" id="btnRefreshCart" class="btn btn-primary btn-sm">
+            🔄 Actualizar Precios
+          </button>
+          <button type="button" id="btnCopyCartSummary" class="btn btn-accent btn-sm">
+            📋 Copiar Lista Óptima
+          </button>
+        </div>
+      </div>
+
+      <!-- Simulador de Tarjetas, Fricción de Despacho y Calendario de Descuentos -->
+      <div class="card" style="margin-top: 1rem;">
+        <div class="panel-header-bar" style="margin-bottom: 0.6rem;">
+          <div>
+            <h3>💳 Simulador de Tarjetas, Despacho y Descuentos por Día</h3>
+            <p class="small-muted">Configura tus tarjetas de crédito/débito y el costo de despacho para ver el ahorro neto real de tu bolsillo.</p>
+          </div>
+        </div>
+
+        <div class="cart-settings-grid">
+          <div class="setting-block">
+            <label><strong>🚚 Costo de Fricción (Despacho / Bencina / Tiempo):</strong></label>
+            <div style="display:flex; align-items:center; gap:0.6rem; margin-top:0.35rem; flex-wrap:wrap;">
+              <label class="checkbox-label">
+                <input type="checkbox" id="cartEnableFriction" checked />
+                <span>Calcular costo por tienda extra</span>
+              </label>
+              <div class="inline-input-group">
+                <span>Costo / tienda: $</span>
+                <input type="number" id="cartDeliveryCost" value="3500" step="500" style="width: 80px;" />
+              </div>
+              <div class="inline-input-group">
+                <span>Gratis sobre: $</span>
+                <input type="number" id="cartFreeDeliveryThreshold" value="35000" step="5000" style="width: 90px;" />
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-block">
+            <label><strong>📅 Día a Simular:</strong></label>
+            <div style="margin-top:0.35rem;">
+              <select id="cartDayOfWeekSelect" style="width:auto; padding:0.4rem 0.7rem;">
+                <option value="-1">Hoy (Automático)</option>
+                <option value="1">Lunes (Día BancoEstado / Cencosud)</option>
+                <option value="2">Martes (Día CMR / Club Unimarc)</option>
+                <option value="3">Miércoles (Día Lider Bci / CMR Carnes)</option>
+                <option value="4">Jueves (Día Cencosud / Tenpo)</option>
+                <option value="5">Viernes (Fin de semana Santa Isabel)</option>
+                <option value="6">Sábado (CMR Puntos)</option>
+                <option value="0">Domingo (Jumbo Prime)</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="setting-block">
+            <label><strong>💳 Mis Tarjetas y Membresías Activas:</strong></label>
+            <div class="cards-checkboxes-row" id="cartProgramsCheckboxes">
+              <label class="checkbox-chip"><input type="checkbox" value="cmr" checked /> <span>CMR Falabella</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="cencosud" checked /> <span>Cencosud Scotiabank / Prime</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="unimarc_club" checked /> <span>Club Unimarc</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="lider_bci" checked /> <span>Tarjeta Lider Bci</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="banco_estado" checked /> <span>BancoEstado / Cuenta RUT / Tenpo</span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Agregar productos al carrito (Individual o Lista Rápida) -->
+      <div class="cart-add-box card" style="margin-top: 1rem;">
+        <div class="cart-add-grid">
+          <form id="formAddCartItem" class="cart-quick-form">
+            <h4>➕ Agregar Producto al Carrito</h4>
+            <p class="small-muted">Buscaremos automáticamente el producto en Jumbo, Santa Isabel, Unimarc y Tottus para compararlo.</p>
+            <div class="cart-quick-inputs">
+              <input
+                type="number"
+                id="cartAddQty"
+                value="1"
+                min="1"
+                max="99"
+                title="Cantidad de unidades/envases"
+                class="qty-input-lg"
+                required
+              />
+              <input
+                type="text"
+                id="cartAddQuery"
+                placeholder="Ej: fideos spaghetti 400g, huevos 12 un, pechuga de pollo, leche entera 1l..."
+                required
+              />
+              <select id="cartAddUnit">
+                <option value="auto">Unidad Auto</option>
+                <option value="kg">Masa (kg/g)</option>
+                <option value="lt">Volumen (L/ml)</option>
+                <option value="un">Unidad (un)</option>
+              </select>
+              <button type="submit" class="btn btn-accent" id="btnAddCartItem">
+                🛒 Añadir al Carrito
+              </button>
+            </div>
+          </form>
+
+          <div class="cart-batch-box">
+            <details>
+              <summary>📝 <strong>Pegar Lista de Compras Completa ( Varios productos a la vez )</strong></summary>
+              <form id="formBatchCartItems" style="margin-top: 0.65rem;">
+                <textarea
+                  id="cartBatchTextarea"
+                  rows="3"
+                  placeholder="Escribe un producto por línea (con su cantidad opcional), ej:&#10;4 x Leche entera 1L&#10;2 x Arroz grado 1 1kg&#10;1 x Detergente líquido 3L"
+                ></textarea>
+                <button type="submit" class="btn btn-primary btn-sm" id="btnSubmitBatchCart" style="margin-top: 0.45rem;">
+                  🚀 Generar Carrito con esta Lista
+                </button>
+              </form>
+            </details>
+          </div>
+        </div>
+      </div>
+
+      <!-- Podio de Resultados: ¿Dónde es más barato? -->
+      <div class="card" style="margin-top: 1rem;">
+        <div class="panel-header-bar" style="margin-bottom: 0.75rem;">
+          <div>
+            <h2>🏆 ¿Dónde es más barato comprar este Carrito?</h2>
+            <p>Comparamos el costo total comprando todo en un solo supermercado vs. combinando 2 tiendas o dividiendo la compra con despacho.</p>
+          </div>
+        </div>
+
+        <!-- Veredicto de Fricción / Despacho -->
+        <div id="cartFrictionVerdictBox" class="friction-verdict-banner" style="display:none;"></div>
+
+        <!-- Estrategias recomendadas (1 tienda vs 2 tiendas vs Compra Dividida) -->
+        <div id="cartStrategiesGrid" class="cart-strategies-grid"></div>
+
+        <!-- Ranking de todos los supermercados (Todo en 1 lugar) -->
+        <h4 style="margin: 1.35rem 0 0.75rem;">📊 Ranking Comprando Todo en un Solo Supermercado</h4>
+        <div id="basketSummaryCards" class="basket-stores-grid"></div>
+      </div>
+
+      <!-- Tabla Interactiva de Productos del Carrito -->
+      <div class="card" style="margin-top: 1rem;">
+        <div class="panel-header-bar" style="margin-bottom: 0.75rem;">
+          <div>
+            <h3>🧾 Detalle de Productos y Cantidades del Carrito</h3>
+            <p class="small-muted">Ajusta las cantidades con <code>-</code> / <code>+</code> o cambia la marca elegida en cualquier supermercado usando el selector desplegable.</p>
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table cart-table" id="basketComparisonTable">
+            <thead>
+              <tr>
+                <th style="width: 220px;">Producto y Cantidad</th>
+                <th>Jumbo</th>
+                <th>Santa Isabel</th>
+                <th>Unimarc</th>
+                <th>Tottus</th>
+                <th>🏆 Mejor Opción</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Desglose de Compra Óptima Dividida por Supermercado -->
+      <div class="card" style="margin-top: 1rem;">
+        <h3>🛍️ Hoja de Ruta: Compra Inteligente Dividida por Supermercado</h3>
+        <p class="small-muted">Si decides comprar cada producto en el supermercado donde es más barato, aquí tienes tu lista separada por tienda con links directos:</p>
+        <div id="splitCartRoadmapGrid" class="split-roadmap-grid" style="margin-top: 1rem;"></div>
+      </div>
+    </section>
+
+    <!-- TAB 3: BUSCADOR EN VIVO Y FALSOS PACKS AHORRO -->
+    <section id="tab-search" class="tab-panel">
+      <div class="search-hero card">
+        <h2>Buscador Multi-Supermercado por $/Unidad y $/10g Proteína</h2>
+        <p>Consulta en paralelo <strong>Jumbo, Santa Isabel, Unimarc y Tottus</strong>. Detectamos automáticamente <strong>Falsos Packs Ahorro</strong> y calculamos la densidad proteica para optimizar tu gasto.</p>
+
+        <form id="liveSearchForm" class="search-bar-row">
+          <input
+            type="text"
+            id="liveSearchInput"
+            placeholder="Ej: arroz grado 1, leche entera, pechuga de pollo, atun en lata, avena instantanea, cafe..."
+            required
+          />
+          <button type="submit" class="btn btn-primary btn-lg" id="btnRunSearch">
+            🔍 Comparar Ahora
+          </button>
+          <button type="button" class="btn btn-accent btn-lg" id="btnTrackCurrentSearch" style="display:none;">
+            📌 Seguir esta Búsqueda Automáticamente
+          </button>
+        </form>
+
+        <div class="quick-chips">
+          <span>Búsquedas rápidas:</span>
+          <button type="button" class="chip" data-q="pechuga de pollo">🍗 Pechuga de Pollo</button>
+          <button type="button" class="chip" data-q="atun lomitos">🐟 Atún en Lata</button>
+          <button type="button" class="chip" data-q="huevos 12">🥚 Huevos</button>
+          <button type="button" class="chip" data-q="leche entera 1 l">🥛 Leche Entera 1L</button>
+          <button type="button" class="chip" data-q="arroz grado 1 1 kg">🍚 Arroz Grado 1</button>
+          <button type="button" class="chip" data-q="aceite maravilla">🌻 Aceite Maravilla</button>
+          <button type="button" class="chip" data-q="avena instantanea">🥣 Avena Instantánea</button>
+          <button type="button" class="chip" data-q="detergente liquido">🧼 Detergente Líquido</button>
+        </div>
+
+        <div class="search-filters-bar">
+          <div class="filter-group">
+            <label>Ordenar por:</label>
+            <select id="searchSortSelect">
+              <option value="unit_asc">🏆 Mejor Precio por Unidad ($/kg, $/L)</option>
+              <option value="protein_asc">🥩 Mejor Precio por Proteína ($/10g)</option>
+              <option value="effective_unit_asc">🏷️ Mejor $/Unidad (con promos 2x / packs)</option>
+              <option value="price_asc">💰 Menor Precio Total ($)</option>
+              <option value="discount_desc">🔥 Mayor % de Descuento</option>
+              <option value="relevance_desc">🎯 Mayor Relevancia</option>
+            </select>
+          </div>
+
+          <div class="filter-group">
+            <label>Filtrar Unidad:</label>
+            <select id="searchUnitFilter">
+              <option value="all">Todas las unidades</option>
+              <option value="kg">Solo Peso / Masa (kg, g)</option>
+              <option value="lt">Solo Volumen / Líquidos (L, ml, cc)</option>
+              <option value="un">Solo Unidades (un)</option>
+            </select>
+          </div>
+
+          <div class="filter-group">
+            <label>Supermercado:</label>
+            <select id="searchStoreFilter">
+              <option value="all">Todos los supermercados</option>
+              <option value="jumbo">Jumbo</option>
+              <option value="santaisabel">Santa Isabel</option>
+              <option value="unimarc">Unimarc</option>
+              <option value="tottus">Tottus</option>
+              <option value="lider">Lider</option>
+            </select>
+          </div>
+        </div>
+      </div>
+
+      <!-- Alertas de Falsos Packs Ahorro Detectados -->
+      <div id="searchPackTrapsBanner" style="display:none; margin: 1rem 0;"></div>
+
+      <div id="searchStoreStatusBar" class="store-status-bar"></div>
+
+      <div id="searchResultsContainer" class="search-results-grid">
+        <div class="empty-state">
+          Ingresa un producto arriba o haz clic en una búsqueda rápida para comparar precios por kilo, litro o 10g de proteína en vivo.
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: IPC PERSONAL E INFLACIÓN DE TU CANASTA -->
+    <section id="tab-ipc" class="tab-panel">
+      <div class="card">
+        <div class="panel-header-bar">
+          <div>
+            <h2>📈 Tu IPC Personal: Inflación Real de tu Hogar</h2>
+            <p>Calcula la variación de precios ponderada de los productos que tú consumes habitualmente frente a la inflación oficial.</p>
+          </div>
+          <button type="button" class="btn btn-primary btn-sm" id="btnRefreshIpc">
+            🔄 Recalcular IPC
+          </button>
+        </div>
+
+        <div class="kpi-grid" style="margin-top: 0.5rem;">
+          <div class="kpi-card highlight-green">
+            <div class="kpi-label">Inflación Acumulada de tu Canasta</div>
+            <div class="kpi-value" id="ipcBasketRate">—</div>
+            <div class="kpi-sub">Variación ponderada de tus productos monitoreados</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Supermercado con Mayor Alza</div>
+            <div class="kpi-value" id="ipcWorstStore">—</div>
+            <div class="kpi-sub" id="ipcWorstStoreSub">Cadena que más subió en tu canasta</div>
+          </div>
+          <div class="kpi-card">
+            <div class="kpi-label">Supermercado con Mayor Contención</div>
+            <div class="kpi-value" id="ipcBestStore">—</div>
+            <div class="kpi-sub" id="ipcBestStoreSub">Cadena más estable o con más bajas</div>
+          </div>
+        </div>
+
+        <div class="two-col-grid" style="margin-top: 1.5rem;">
+          <div>
+            <h4>🔴 Productos con Mayor Alza de Precio</h4>
+            <div class="table-responsive" style="margin-top: 0.5rem;">
+              <table class="data-table" id="ipcIncreasesTable">
+                <thead>
+                  <tr>
+                    <th>Producto</th>
+                    <th>Categoría</th>
+                    <th>Alza (%)</th>
+                    <th>Precio Actual</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+
+          <div>
+            <h4>🟢 Productos con Mayor Baja de Precio</h4>
+            <div class="table-responsive" style="margin-top: 0.5rem;">
+              <table class="data-table" id="ipcDecreasesTable">
+                <thead>
+                  <tr>
+                    <th>Producto</th>
+                    <th>Categoría</th>
+                    <th>Baja (%)</th>
+                    <th>Precio Actual</th>
+                  </tr>
+                </thead>
+                <tbody></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div style="margin-top: 1.5rem;">
+          <h4>🏪 Inflación Registrada por Cadena de Supermercado</h4>
+          <div class="table-responsive" style="margin-top: 0.5rem;">
+            <table class="data-table" id="ipcStoreTable">
+              <thead>
+                <tr>
+                  <th>Supermercado</th>
+                  <th>Inflación en tu Canasta (%)</th>
+                  <th>Productos Evaluados</th>
+                  <th>Comportamiento</th>
+                </tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 5: HERRAMIENTAS: BOOKMARKLET 1-CLIC, LIDER Y ALERTAS TELEGRAM -->
+    <section id="tab-links" class="tab-panel">
+      <!-- Módulo 1: Bookmarklet de 1 Clic -->
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="panel-header-bar">
+          <div>
+            <h2>⚡ Bookmarklet de 1 Clic: Importa Precios desde Cualquier Navegador</h2>
+            <p>La forma más rápida y cómoda de importar búsquedas o productos de <strong>Lider (Walmart), Jumbo, Santa Isabel o Tottus</strong> sin lidiar con bloqueos antibot.</p>
+          </div>
+        </div>
+
+        <div class="bookmarklet-box">
+          <div class="bookmarklet-btn-wrap">
+            <a
+              id="bookmarkletLink"
+              href="#"
+              class="btn btn-accent btn-lg bookmarklet-button"
+              title="Arrastra este botón a tu barra de marcadores"
+              onclick="alert('¡No hagas clic aquí! Arrastra este botón a tu barra de marcadores de Chrome o Edge (Ctrl + Shift + B).'); return false;"
+            >
+              🛒 Importar a SuperPrecio CL
+            </a>
+            <span class="small-muted">⬅️ <strong>Arrastra este botón a tu barra de favoritos de Chrome/Edge (Ctrl + Shift + B)</strong></span>
+          </div>
+
+          <div class="bookmarklet-instructions">
+            <h4>¿Cómo se usa? (Apuntando automáticamente a <code id="bookmarkletOriginCode">este servidor</code>)</h4>
+            <ol>
+              <li>Arrastra el botón verde de arriba a tu barra de marcadores de Chrome o Edge.</li>
+              <li>Abre <code>super.lider.cl</code> (o cualquier búsqueda en el súper) normalmente en tu navegador.</li>
+              <li>Haz clic en el marcador <strong>"🛒 Importar a SuperPrecio CL"</strong> en tu barra de favoritos.</li>
+              <li>¡Listo! Los productos y precios se enviarán automáticamente a este comparador (incluso si está en la nube por HTTPS) y quedarán guardados en tu base de datos.</li>
+            </ol>
+          </div>
+        </div>
+      </div>
+
+      <!-- Módulo 2: Alertas Push por Telegram Bot -->
+      <div class="card" style="margin-bottom: 1.25rem;">
+        <div class="panel-header-bar">
+          <div>
+            <h2>🔔 Alertas Push en Telegram (Pisos Históricos y Rebajas)</h2>
+            <p>Recibe un mensaje en tu celular vía Telegram cuando el programador automático detecte que un producto que te interesa bajó de precio o alcanzó su <strong>Piso Histórico (🟢)</strong>.</p>
+          </div>
+        </div>
+
+        <form id="telegramSettingsForm" class="stack-form">
+          <div class="form-row-2">
+            <div class="form-field">
+              <label>Telegram Bot Token (obtenido de @BotFather):</label>
+              <input type="text" id="teleTokenInput" placeholder="Ej: 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
+            </div>
+            <div class="form-field">
+              <label>Chat ID (obtenido de @userinfobot):</label>
+              <input type="text" id="teleChatIdInput" placeholder="Ej: 987654321" />
+            </div>
+          </div>
+
+          <div class="form-row-2" style="align-items: center;">
+            <div class="form-field">
+              <label>Umbral de rebaja para alertar (%):</label>
+              <input type="number" id="teleThresholdInput" value="12" min="5" max="50" style="width: 120px;" />
+              <small class="small-muted">Te avisará si el precio baja este porcentaje o más.</small>
+            </div>
+            <div class="form-field">
+              <label class="checkbox-label" style="margin-top: 1.2rem;">
+                <input type="checkbox" id="teleEnabledInput" />
+                <span><strong>Activar Alertas Automáticas por Telegram</strong></span>
+              </label>
+            </div>
+          </div>
+
+          <div style="display:flex; gap:0.75rem; margin-top:0.5rem;">
+            <button type="submit" class="btn btn-primary">
+              💾 Guardar Ajustes de Telegram
+            </button>
+            <button type="button" class="btn btn-secondary" id="btnTestTelegram">
+              🔔 Probar Alerta en mi Celular
+            </button>
+          </div>
+        </form>
+      </div>
+
+      <div class="two-col-grid">
+        <!-- Columna 1: Seguir o fijar por URL directa -->
+        <div class="card">
+          <h2>🔗 Agregar o Fijar Producto por Link Exacto</h2>
+          <p>Pega el link de cualquier producto de <strong>Jumbo, Santa Isabel, Unimarc o Tottus</strong>. Extraeremos automáticamente su precio vigente, su peso/volumen y su precio por kilo o litro.</p>
+
+          <form id="urlLookupForm" class="stack-form">
+            <div class="form-field">
+              <label>URL del producto en el supermercado:</label>
+              <input
+                type="url"
+                id="urlLookupInput"
+                placeholder="https://www.jumbo.cl/... o https://www.unimarc.cl/product/... o https://www.tottus.cl/..."
+                required
+              />
+            </div>
+
+            <div class="form-field">
+              <label>¿Dónde quieres guardarlo?</label>
+              <select id="urlTargetTrackedSelect">
+                <option value="new">➕ Crear como nuevo producto seguido</option>
+              </select>
+            </div>
+
+            <div class="form-field" id="urlNewTitleField">
+              <label>Nombre del grupo / producto (opcional):</label>
+              <input
+                type="text"
+                id="urlNewTitleInput"
+                placeholder="Ej: Mi Café Nescafé 170g"
+              />
+            </div>
+
+            <button type="submit" class="btn btn-primary" id="btnLookupUrl">
+              🔍 Extraer Precio y Guardar en Seguimiento
+            </button>
+          </form>
+
+          <div id="urlLookupResultBox" style="margin-top: 1rem;"></div>
+        </div>
+
+        <!-- Columna 2: Registro manual o importación de Lider -->
+        <div class="card">
+          <h2>🟦 Registrar Precio de Lider o Entrada Manual</h2>
+          <p>También puedes registrar mediciones manuales de boletas o supermercados físicos para enriquecer tu historial.</p>
+
+          <form id="manualEntryForm" class="stack-form">
+            <div class="form-row-2">
+              <div class="form-field">
+                <label>Asociar a Producto Seguido:</label>
+                <select id="manualTrackedSelect" required></select>
+              </div>
+              <div class="form-field">
+                <label>Supermercado:</label>
+                <select id="manualStoreSelect">
+                  <option value="lider">Lider</option>
+                  <option value="jumbo">Jumbo</option>
+                  <option value="santaisabel">Santa Isabel</option>
+                  <option value="unimarc">Unimarc</option>
+                  <option value="tottus">Tottus</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-field">
+                <label>Nombre completo del producto (incluye peso/volumen):</label>
+                <input
+                  type="text"
+                  id="manualNameInput"
+                  placeholder="Ej: Leche Entera Colun 1 L"
+                  required
+                />
+              </div>
+              <div class="form-field">
+                <label>Marca:</label>
+                <input type="text" id="manualBrandInput" placeholder="Ej: Colun" />
+              </div>
+            </div>
+
+            <div class="form-row-2">
+              <div class="form-field">
+                <label>Precio Vigente (CLP $):</label>
+                <input
+                  type="number"
+                  id="manualPriceInput"
+                  placeholder="Ej: 990"
+                  min="1"
+                  required
+                />
+              </div>
+              <div class="form-field">
+                <label>Formato / Medida (para cálculo de $/kg o $/L):</label>
+                <input
+                  type="text"
+                  id="manualFormatInput"
+                  placeholder="Ej: 1 L, 900 g, 250 ml, 6 x 200 ml"
+                  required
+                />
+              </div>
+            </div>
+
+            <button type="submit" class="btn btn-accent">
+              💾 Guardar Medición en el Historial
+            </button>
+          </form>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- MODAL: NUEVO PRODUCTO EN SEGUIMIENTO -->
+  <div id="modalNewTracked" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>➕ Agregar Producto al Seguimiento Automático</h3>
+        <button type="button" class="modal-close" id="btnCloseNewTrackModal">&times;</button>
+      </div>
+      <form id="formNewTracked" class="stack-form">
+        <div class="form-field">
+          <label>Nombre descriptivo del producto:</label>
+          <input
+            type="text"
+            id="newTrackTitle"
+            placeholder="Ej: Arroz Grado 1, Pechuga de Pollo, Café Instantáneo"
+            required
+          />
+        </div>
+        <div class="form-field">
+          <label>Término de búsqueda automática en supermercados:</label>
+          <input
+            type="text"
+            id="newTrackQuery"
+            placeholder="Ej: arroz grado 1 1 kg"
+            required
+          />
+          <small class="small-muted">El sistema buscará este término en Jumbo, Santa Isabel, Unimarc y Tottus y registrará el mejor precio por unidad.</small>
+        </div>
+        <div class="form-row-2">
+          <div class="form-field">
+            <label>Unidad principal a comparar:</label>
+            <select id="newTrackUnit">
+              <option value="auto">Automática (según producto)</option>
+              <option value="kg">Por Kilo / Gramos (kg / 100g / g)</option>
+              <option value="lt">Por Litro / Mililitros (L / 100ml / ml)</option>
+              <option value="un">Por Unidad (un)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Categoría:</label>
+            <select id="newTrackCategory">
+              <option value="Despensa">Despensa</option>
+              <option value="Lácteos">Lácteos y Huevos</option>
+              <option value="Carnes">Carnes y Pescados</option>
+              <option value="Frutas y Verduras">Frutas y Verduras</option>
+              <option value="Bebidas">Bebidas y Líquidos</option>
+              <option value="Aseo y Limpieza">Aseo y Limpieza</option>
+              <option value="Cuidado Personal">Cuidado Personal</option>
+              <option value="Otros">Otros</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btnCancelNewTrack">Cancelar</button>
+          <button type="submit" class="btn btn-primary" id="btnSubmitNewTrack">
+            🚀 Crear y Consultar Precios Ahora
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: NUEVO CARRITO DE COMPRA -->
+  <div id="modalNewCart" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🛒 Crear Nuevo Carrito de Compras</h3>
+        <button type="button" class="modal-close" id="btnCloseNewCartModal">&times;</button>
+      </div>
+      <form id="formNewCart" class="stack-form">
+        <div class="form-field">
+          <label>Nombre del carrito:</label>
+          <input
+            type="text"
+            id="newCartNameInput"
+            placeholder="Ej: Compra del Mes, Asado Familiar, Despensa Semanal..."
+            required
+          />
+        </div>
+        <div class="form-field">
+          <label>Lista inicial de productos (opcional, uno por línea):</label>
+          <textarea
+            id="newCartBatchInput"
+            rows="4"
+            placeholder="Ej:&#10;4 x Leche entera 1L&#10;2 x Arroz grado 1 1kg&#10;1 x Aceite maravilla&#10;2 x Fideos spaghetti 400g"
+          ></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btnCancelNewCartModal">Cancelar</button>
+          <button type="submit" class="btn btn-accent" id="btnSubmitNewCart">
+            🛒 Crear y Comparar Carrito
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: FIJAR PRODUCTO ESPECÍFICO DESDE BÚSQUEDA -->
+  <div id="modalPinProduct" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>📌 Fijar Producto Específico en Seguimiento</h3>
+        <button type="button" class="modal-close" id="btnClosePinModal">&times;</button>
+      </div>
+      <div id="pinProductPreview" class="pin-preview-box"></div>
+      <form id="formPinProduct" class="stack-form">
+        <div class="form-field">
+          <label>¿En qué producto seguido quieres fijarlo?</label>
+          <select id="pinTargetSelect"></select>
+        </div>
+        <div class="form-field" id="pinNewTitleWrap" style="display: none;">
+          <label>Nombre para el nuevo seguimiento:</label>
+          <input type="text" id="pinNewTitleInput" placeholder="Ej: Leche Entera 1L" />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btnCancelPinModal">Cancelar</button>
+          <button type="submit" class="btn btn-primary">📌 Fijar y Registrar Precio</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: ACCESO PROTEGIDO (Cuando ACCESS_PASSWORD está configurada en la nube) -->
+  <div id="authOverlay" class="modal-backdrop" style="display: none; backdrop-filter: blur(10px); z-index: 200;">
+    <div class="modal-card" style="max-width: 420px;">
+      <div class="modal-header">
+        <h3>🔒 Acceso Privado — SuperPrecio CL</h3>
+      </div>
+      <p class="small-muted" style="margin-bottom: 1rem;">
+        Ingresa la contraseña de acceso configurada en el servidor para ver y administrar tus comparaciones, carritos y alertas.
+      </p>
+      <form id="authLoginForm" class="stack-form">
+        <div class="form-field">
+          <label for="authPasswordInput">Contraseña de acceso:</label>
+          <input
+            type="password"
+            id="authPasswordInput"
+            placeholder="••••••••"
+            autocomplete="current-password"
+            required
+          />
+        </div>
+        <div id="authErrorMsg" style="color:#f87171; font-size:0.84rem; display:none;"></div>
+        <button type="submit" class="btn btn-primary" id="btnAuthLogin">
+          🔓 Desbloquear Comparador
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <div id="toastContainer" class="toast-container"></div>
+
+  <script src="/app.js" type="module"></script>
+</body>
+</html>
