@@ -79,6 +79,9 @@ db.exec(`
     promo_text TEXT,
     product_url TEXT,
     image_url TEXT,
+    in_stock INTEGER NOT NULL DEFAULT 1,
+    stock_status TEXT NOT NULL DEFAULT 'in_stock',
+    store_zone TEXT NOT NULL DEFAULT '',
     recorded_at TEXT NOT NULL,
     FOREIGN KEY (tracked_item_id) REFERENCES tracked_items(id) ON DELETE CASCADE
   );
@@ -110,6 +113,17 @@ export function setSetting(key, value) {
 const trackedCols = db.prepare("PRAGMA table_info(tracked_items)").all();
 if (!trackedCols.some((c) => c.name === "target_price_clp")) {
   db.exec("ALTER TABLE tracked_items ADD COLUMN target_price_clp INTEGER;");
+}
+
+const snapCols = db.prepare("PRAGMA table_info(price_snapshots)").all();
+if (!snapCols.some((c) => c.name === "in_stock")) {
+  db.exec("ALTER TABLE price_snapshots ADD COLUMN in_stock INTEGER NOT NULL DEFAULT 1;");
+}
+if (!snapCols.some((c) => c.name === "stock_status")) {
+  db.exec("ALTER TABLE price_snapshots ADD COLUMN stock_status TEXT NOT NULL DEFAULT 'in_stock';");
+}
+if (!snapCols.some((c) => c.name === "store_zone")) {
+  db.exec("ALTER TABLE price_snapshots ADD COLUMN store_zone TEXT NOT NULL DEFAULT '';");
 }
 
 if (getSetting("auto_interval_minutes") === null) {
@@ -270,12 +284,18 @@ export function insertSnapshot({
   product,
   recordedAt = new Date().toISOString(),
 }) {
+  const inStockInt = product.inStock === false || product.stockStatus === "out_of_stock" ? 0 : 1;
+  const stockStatus =
+    product.stockStatus || (inStockInt === 0 ? "out_of_stock" : "in_stock");
+  const storeZone = String(product.storeZone || "").trim();
+
   db.prepare(
     `INSERT INTO price_snapshots (
       tracked_item_id, pinned_product_id, store, external_id, product_name,
       brand, price, list_price, member_price, unit_price, effective_unit_price,
-      unit, price_per_100, format_label, promo_text, product_url, image_url, recorded_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      unit, price_per_100, format_label, promo_text, product_url, image_url,
+      in_stock, stock_status, store_zone, recorded_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     Number(trackedItemId),
     pinnedProductId ? Number(pinnedProductId) : null,
@@ -294,6 +314,9 @@ export function insertSnapshot({
     product.promoText || null,
     product.url || "",
     product.imageUrl || "",
+    inStockInt,
+    stockStatus,
+    storeZone,
     recordedAt
   );
 
@@ -304,7 +327,7 @@ export function insertSnapshot({
 }
 
 /**
- * Inserta snapshot solo si cambió algún precio/formato/promo respecto al último
+ * Inserta snapshot solo si cambió algún precio/formato/promo/stock respecto al último
  * snapshot de esa tienda; si todo sigue idéntico, actualiza su timestamp para evitar
  * duplicar filas redundantes en las corridas automáticas de 6 horas.
  */
@@ -330,6 +353,10 @@ export function touchOrInsertSnapshot({
   const nextMember = product.memberPrice ? Math.round(product.memberPrice) : null;
   const nextPromo = product.promoText || "";
   const nextFmt = product.formatLabel || "";
+  const nextInStock = product.inStock === false || product.stockStatus === "out_of_stock" ? 0 : 1;
+  const nextStockStatus =
+    product.stockStatus || (nextInStock === 0 ? "out_of_stock" : "in_stock");
+  const nextStoreZone = String(product.storeZone || "").trim();
 
   const isUnchanged =
     latest &&
@@ -340,7 +367,10 @@ export function touchOrInsertSnapshot({
     (latest.list_price ?? null) === nextList &&
     (latest.member_price ?? null) === nextMember &&
     (latest.promo_text || "") === nextPromo &&
-    (latest.format_label || "") === nextFmt;
+    (latest.format_label || "") === nextFmt &&
+    Number(latest.in_stock ?? 1) === nextInStock &&
+    String(latest.stock_status || "in_stock") === nextStockStatus &&
+    String(latest.store_zone || "") === nextStoreZone;
 
   if (isUnchanged) {
     const nextUrl = product.url || latest.product_url || "";
@@ -348,9 +378,9 @@ export function touchOrInsertSnapshot({
     const nextPinnedId = pinnedProductId ? Number(pinnedProductId) : latest.pinned_product_id;
     db.prepare(
       `UPDATE price_snapshots
-       SET recorded_at = ?, product_url = ?, image_url = ?, pinned_product_id = ?
+       SET recorded_at = ?, product_url = ?, image_url = ?, pinned_product_id = ?, store_zone = ?
        WHERE id = ?`
-    ).run(recordedAt, nextUrl, nextImg, nextPinnedId, latest.id);
+    ).run(recordedAt, nextUrl, nextImg, nextPinnedId, nextStoreZone, latest.id);
 
     db.prepare("UPDATE tracked_items SET last_checked_at = ? WHERE id = ?").run(
       recordedAt,
@@ -546,6 +576,9 @@ export function enrichTrackedItemWithStats(item) {
       nutrition_seals: nut.nutritionSeals || [],
       inferred_category: nut.inferredCategory || inferProductCategory(latest.product_name),
       price_range_pct: priceRangePct,
+      in_stock: latest.in_stock !== 0 && latest.stock_status !== "out_of_stock",
+      stock_status: latest.stock_status || (latest.in_stock === 0 ? "out_of_stock" : "in_stock"),
+      store_zone: latest.store_zone || "",
       is_pure: purity.isPure,
       is_blend: purity.isBlend,
       purity_warning: purity.purityWarning,
@@ -578,8 +611,10 @@ export function enrichTrackedItemWithStats(item) {
   }
 
   const activeLatest = Object.values(latestByStore);
-  const purePool = activeLatest.filter((s) => s.is_pure !== false);
-  const candidatePool = purePool.length > 0 ? purePool : activeLatest;
+  const inStockPool = activeLatest.filter((s) => s.in_stock !== false && s.stock_status !== "out_of_stock");
+  const stockPool = inStockPool.length > 0 ? inStockPool : activeLatest;
+  const purePool = stockPool.filter((s) => s.is_pure !== false);
+  const candidatePool = purePool.length > 0 ? purePool : stockPool;
 
   const byUnit = [...candidatePool].sort((a, b) => a.unit_price - b.unit_price);
   const bestByUnitPrice = byUnit[0] || null;

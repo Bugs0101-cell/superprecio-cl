@@ -1,4 +1,4 @@
-import { db, listTrackedItems } from "./db.mjs";
+import { db, getSetting, listTrackedItems } from "./db.mjs";
 import {
   calculateDiscountedPricing,
   getTodayDayIndex,
@@ -112,6 +112,10 @@ function toCartCandidate(p, storeOverride = null) {
     nutritionGrade: nut.nutritionGrade,
     nutritionBadge: nut.nutritionBadge,
     nutritionSeals: nut.nutritionSeals || [],
+    inStock: p.inStock !== false,
+    stockStatus: p.stockStatus || (p.inStock === false ? "out_of_stock" : "in_stock"),
+    storeZone: p.storeZone || "",
+    availableStores: Array.isArray(p.availableStores) ? p.availableStores : [],
     linkStatus: p.linkStatus || "unknown",
     url: normalizeProductUrl(p.url || "", store),
     imageUrl: p.imageUrl || "",
@@ -135,6 +139,7 @@ function enrichCartCandidate(c, searchQuery, storeOverride = null) {
     promoUnitPrice && c.baseAmount > 0
       ? Math.round(promoUnitPrice / c.baseAmount)
       : c.effectiveUnitPrice || c.unitPrice;
+  const inStock = c.inStock !== false && c.stockStatus !== "out_of_stock";
 
   return {
     ...c,
@@ -144,6 +149,9 @@ function enrichCartCandidate(c, searchQuery, storeOverride = null) {
     promoMinQty,
     promoBundlePrice: c.promoBundlePrice || bundle?.bundlePrice || null,
     effectiveUnitPrice,
+    inStock,
+    stockStatus: c.stockStatus || (inStock ? "in_stock" : "out_of_stock"),
+    storeZone: c.storeZone || "",
     url: normalizeProductUrl(c.url || "", store),
     category: nut.inferredCategory || inferProductCategory(c.name),
     hasProteinData: nut.hasProteinData,
@@ -183,11 +191,14 @@ function getCandidateSpec(c) {
  * dejar la selección automática o elegir una marca/formato específico.
  */
 export async function fetchCandidatesForCartQuery(searchQuery, preferredUnit = "auto") {
+  const jumboStore = getSetting("preferred_jumbo_store", "");
   const res = await searchAllStores(searchQuery, {
     stores: AUTO_STORES,
     limitPerStore: 14,
     minRelevance: 0.4,
     verifyLinks: true,
+    jumboStore,
+    includeOutOfStock: true,
   });
 
   const targetUnit = detectDominantUnit(res.products, preferredUnit);
@@ -195,8 +206,10 @@ export async function fetchCandidatesForCartQuery(searchQuery, preferredUnit = "
 
   for (const storeId of AUTO_STORES) {
     const storeProds = res.products.filter((p) => p.store === storeId);
-    const unitMatched = storeProds.filter((p) => p.unit === targetUnit);
-    const list = (unitMatched.length > 0 ? unitMatched : storeProds).slice(0, 6);
+    const inStockProds = storeProds.filter((p) => p.inStock !== false);
+    const basePool = inStockProds.length > 0 ? inStockProds : storeProds;
+    const unitMatched = basePool.filter((p) => p.unit === targetUnit);
+    const list = (unitMatched.length > 0 ? unitMatched : basePool).slice(0, 6);
     candidatesByStore[storeId] = list.map((p) => toCartCandidate(p));
   }
 
@@ -254,6 +267,10 @@ function computeLinePricing(candidate, quantity) {
  * - Calcula el carrito óptimo dividido (cada producto donde es más barato)
  */
 function compareByCartCriteria(prodA, prodB, lineA, lineB, criteria) {
+  const stockA = prodA.inStock !== false && prodA.stockStatus !== "out_of_stock" ? 0 : 1;
+  const stockB = prodB.inStock !== false && prodB.stockStatus !== "out_of_stock" ? 0 : 1;
+  if (stockA !== stockB) return stockA - stockB;
+
   const pureA = prodA.isPure !== false ? 0 : 1;
   const pureB = prodB.isPure !== false ? 0 : 1;
   if (pureA !== pureB) return pureA - pureB;
@@ -365,8 +382,12 @@ export function evaluateCart(cartRow) {
 
       const candidates = rawCandidates.map((c) => enrichCartCandidate(c, qCheck, storeId));
 
-      // Ordenar priorizando equivalencia de pureza, formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
+      // Ordenar priorizando stock disponible, equivalencia de pureza, formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
       candidates.sort((a, b) => {
+        const stockA = a.inStock !== false && a.stockStatus !== "out_of_stock" ? 0 : 1;
+        const stockB = b.inStock !== false && b.stockStatus !== "out_of_stock" ? 0 : 1;
+        if (stockA !== stockB) return stockA - stockB;
+
         const pureA = a.isPure !== false ? 0 : 1;
         const pureB = b.isPure !== false ? 0 : 1;
         if (pureA !== pureB) return pureA - pureB;
@@ -481,6 +502,7 @@ export function evaluateCart(cartRow) {
     let normalTotalClp = 0;
     let discountedTotalClp = 0;
     let foundCount = 0;
+    let outOfStockCount = 0;
     let totalProteinGramsRaw = 0;
     let proteinSpendClp = 0;
     let scoreSum = 0;
@@ -494,6 +516,9 @@ export function evaluateCart(cartRow) {
         normalTotalClp += offer.normalLineTotal;
         discountedTotalClp += offer.discountedLineTotal;
         foundCount++;
+        if (offer.product?.inStock === false || offer.product?.stockStatus === "out_of_stock") {
+          outOfStockCount++;
+        }
         const protGrams = (offer.product?.proteinGramsTotal || 0) * (offer.qty || 1);
         if (protGrams > 0) {
           totalProteinGramsRaw += protGrams;
@@ -547,10 +572,12 @@ export function evaluateCart(cartRow) {
         offerSavingsClp: Math.max(0, normalTotalClp - totalClp),
         cardSavingsClp: Math.max(0, totalClp - discountedTotalClp),
         foundCount,
+        inStockFoundCount: Math.max(0, foundCount - outOfStockCount),
+        outOfStockCount,
         totalItemsCount,
         missingCount: totalItemsCount - foundCount,
         missingItems,
-        isComplete: foundCount === totalItemsCount,
+        isComplete: foundCount === totalItemsCount && outOfStockCount === 0,
         totalProteinGrams,
         proteinSpendClp,
         avgCostPer10gProtein,
@@ -559,8 +586,9 @@ export function evaluateCart(cartRow) {
     }
   }
 
-  // Priorizar tiendas con más productos encontrados, y luego menor costo neto (con dcto tarjetas + despacho)
+  // Priorizar tiendas con más productos CON STOCK, luego encontradas, luego menor costo neto
   singleStoreRanking.sort((a, b) => {
+    if (b.inStockFoundCount !== a.inStockFoundCount) return b.inStockFoundCount - a.inStockFoundCount;
     if (b.foundCount !== a.foundCount) return b.foundCount - a.foundCount;
     return a.netDiscountedTotalClp - b.netDiscountedTotalClp || a.discountedTotalClp - b.discountedTotalClp;
   });
@@ -1131,6 +1159,58 @@ export async function refreshCartPrices(cartId) {
   );
 
   return getCartById(cartId);
+}
+
+/**
+ * Actualiza stock / oferta de supermercados concretos dentro de todos los carritos
+ * cuando el usuario importa o verifica disponibilidad desde su navegador (ej. Tottus Viña del Mar agotado).
+ */
+export function syncBrowserOffersToCarts(products = []) {
+  if (!Array.isArray(products) || products.length === 0) return 0;
+  const rows = db.prepare("SELECT * FROM cart_items").all();
+  let updatedCount = 0;
+
+  for (const row of rows) {
+    let parsed = {};
+    try {
+      parsed = JSON.parse(row.options_json || "{}");
+    } catch {
+      continue;
+    }
+    const cbs = parsed.candidatesByStore;
+    if (!cbs || typeof cbs !== "object") continue;
+
+    let changed = false;
+    for (const bp of products) {
+      if (!bp?.store || !Array.isArray(cbs[bp.store])) continue;
+      for (let i = 0; i < cbs[bp.store].length; i++) {
+        const cand = cbs[bp.store][i];
+        const sameExt = String(cand.externalId) === String(bp.externalId);
+        const sameSku = String(cand.sku) === String(bp.sku);
+        const sameUrl = cand.url && bp.url && cand.url.split("?")[0] === bp.url.split("?")[0];
+        if (sameExt || sameSku || sameUrl) {
+          cbs[bp.store][i] = {
+            ...cand,
+            price: bp.price > 10 ? bp.price : cand.price,
+            unitPrice: bp.price > 10 ? bp.unitPrice : cand.unitPrice,
+            inStock: bp.inStock !== false,
+            stockStatus: bp.stockStatus || (bp.inStock === false ? "out_of_stock" : "in_stock"),
+            storeZone: bp.storeZone || cand.storeZone || "",
+          };
+          changed = true;
+        }
+      }
+    }
+
+    if (changed) {
+      db.prepare("UPDATE cart_items SET options_json = ? WHERE id = ?").run(
+        JSON.stringify(parsed),
+        row.id
+      );
+      updatedCount++;
+    }
+  }
+  return updatedCount;
 }
 
 /**

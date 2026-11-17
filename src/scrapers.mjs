@@ -199,7 +199,7 @@ function parseCencosudSkuData(data) {
   }
 }
 
-export async function searchCencosud(storeId, query, limit = 18) {
+export async function searchCencosud(storeId, query, limit = 18, options = {}) {
   const cfg = CENCOSUD_CONFIGS[storeId];
   if (!cfg) throw new Error(`Banner Cencosud desconocido: ${storeId}`);
 
@@ -212,6 +212,10 @@ export async function searchCencosud(storeId, query, limit = 18) {
     num_results_per_page: String(Math.min(limit, 40)),
     _dt: String(Date.now()),
   });
+
+  if (storeId === "jumbo" && options.jumboStore) {
+    params.append("filters[SellerVSS]", String(options.jumboStore).trim());
+  }
 
   const url = `https://${cfg.host}/search/${encodeURIComponent(query)}?${params.toString()}`;
   const res = await fetch(url, {
@@ -230,12 +234,16 @@ export async function searchCencosud(storeId, query, limit = 18) {
   const json = await res.json();
   const results = json?.response?.results ?? [];
 
-  return results
-    .map((r) => mapCencosudItem(cfg, r))
-    .filter((item) => item !== null && item.inStock);
+  const mapped = results
+    .map((r) => mapCencosudItem(cfg, r, options.jumboStore || ""))
+    .filter(Boolean);
+
+  return options.includeOutOfStock === false
+    ? mapped.filter((item) => item.inStock)
+    : mapped;
 }
 
-function mapCencosudItem(cfg, result) {
+function mapCencosudItem(cfg, result, selectedStoreCode = "") {
   const data = result?.data;
   const name = result?.value ?? data?.ProductName;
   if (!data || !name || !data.id) return null;
@@ -250,6 +258,9 @@ function mapCencosudItem(cfg, result) {
     data.stockLevel !== undefined
       ? data.stockLevel === "in-stock"
       : data.outOfStock !== true;
+  const stockStatus = inStock ? "in_stock" : "out_of_stock";
+  const availableStores = Array.isArray(data.SellerVSS) ? data.SellerVSS : [];
+  const storeZone = selectedStoreCode || (data.storeId ? String(data.storeId) : "");
 
   const sku = parseCencosudSkuData(data);
   const storeUnit = sku?.measurement_unit_un
@@ -306,13 +317,16 @@ function mapCencosudItem(cfg, result) {
     imageUrl: data.image_url || "",
     url: productUrl,
     inStock,
+    stockStatus,
+    storeZone,
+    availableStores,
     fetchedAt: new Date().toISOString(),
   };
 }
 
 // --- 2. Adaptador Unimarc (BFF Ecommerce VTEX) ---
 
-export async function searchUnimarc(query, limit = 18) {
+export async function searchUnimarc(query, limit = 18, options = {}) {
   const res = await fetch(
     "https://bff-unimarc-ecommerce.unimarc.cl/catalog/product/search",
     {
@@ -342,11 +356,17 @@ export async function searchUnimarc(query, limit = 18) {
   }
 
   const json = await res.json();
-  const products = json?.availableProducts ?? [];
-  return products.map(mapUnimarcItem).filter(Boolean);
+  const avail = (json?.availableProducts ?? []).map((p) => mapUnimarcItem(p, true)).filter(Boolean);
+  if (options.includeOutOfStock === false) {
+    return avail.filter((i) => i.inStock);
+  }
+  const notAvail = (json?.notAvailableProducts ?? [])
+    .map((p) => mapUnimarcItem(p, false))
+    .filter(Boolean);
+  return [...avail, ...notAvail];
 }
 
-function mapUnimarcItem(p) {
+function mapUnimarcItem(p, isAvailableList = true) {
   const item = p?.item;
   const priceInfo = p?.price;
   if (!item?.name || !item?.sku || !priceInfo) return null;
@@ -395,6 +415,10 @@ function mapUnimarcItem(p) {
 
   const nutFields = resolveBrandAndNutrition(item.name, item.brand, unitMetrics, price);
 
+  const qtyAvail = priceInfo.availableQuantity;
+  const hasStockQty = qtyAvail === undefined || qtyAvail === null || Number(qtyAvail) > 0;
+  const inStock = Boolean(isAvailableList && hasStockQty);
+
   return {
     store: "unimarc",
     storeName: "Unimarc",
@@ -419,7 +443,9 @@ function mapUnimarcItem(p) {
     ...nutFields,
     imageUrl: item.images?.[0] || "",
     url: productUrl,
-    inStock: true,
+    inStock,
+    stockStatus: inStock ? "in_stock" : "out_of_stock",
+    storeZone: "",
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -503,6 +529,26 @@ function mapTottusItem(p) {
 
   const nutFields = resolveBrandAndNutrition(p.displayName, p.brand, unitMetrics, price);
 
+  const availObj = p.availability || {};
+  const hasZoneAvailability = Boolean(
+    availObj.homeDeliveryShipping ||
+      availObj.pickUpFromStoreShipping ||
+      availObj.expressShipping ||
+      availObj.primeShipping
+  );
+  const badgeText = JSON.stringify(p.multipurposeBadges || []);
+  const explicitOut =
+    p.isOutOfStock === true ||
+    p.sellable === false ||
+    /agotad|sin stock/i.test(badgeText);
+
+  const inStock = !explicitOut;
+  const stockStatus = explicitOut
+    ? "out_of_stock"
+    : hasZoneAvailability
+    ? "in_stock"
+    : "unverified_zone";
+
   return {
     store: "tottus",
     storeName: "Tottus",
@@ -526,7 +572,9 @@ function mapTottusItem(p) {
     ...nutFields,
     imageUrl: p.mediaUrls?.[0] || "",
     url: p.url || "https://www.tottus.cl",
-    inStock: true,
+    inStock,
+    stockStatus,
+    storeZone: "",
     fetchedAt: new Date().toISOString(),
   };
 }
@@ -795,37 +843,163 @@ export function parseLiderRawInput(rawText, pageUrl = "") {
   return mapped;
 }
 
-export function parseLiderCartPayload({ rawContent = "", cartItems = [], url = "" }) {
-  if (Array.isArray(cartItems) && cartItems.length > 0) {
+export function detectStoreFromUrl(rawUrl = "") {
+  const u = String(rawUrl || "").toLowerCase();
+  if (u.includes("tottus.cl") || u.includes("falabella.com")) return "tottus";
+  if (u.includes("jumbo.cl")) return "jumbo";
+  if (u.includes("santaisabel.cl") || u.includes("sisa.cl")) return "santaisabel";
+  if (u.includes("unimarc.cl")) return "unimarc";
+  return "lider";
+}
+
+export function buildNormalizedBrowserProduct({
+  store = "lider",
+  id,
+  name,
+  brand = "",
+  price,
+  listPrice,
+  memberPrice = null,
+  ppu = null,
+  description = "",
+  promoText = null,
+  bundlePricePerItem = null,
+  imageUrl = "",
+  url = "",
+  inStock = true,
+  stockStatus = null,
+  storeZone = "",
+}) {
+  const baseProd = buildNormalizedLiderProduct({
+    id,
+    name,
+    brand,
+    price,
+    listPrice,
+    memberPrice,
+    ppu,
+    description,
+    promoText,
+    bundlePricePerItem,
+    imageUrl,
+    url: url || (STORES[store]?.domain ? `https://www.${STORES[store].domain}` : "https://www.lider.cl"),
+    inStock,
+  });
+  return {
+    ...baseProd,
+    store,
+    storeName: STORES[store]?.name || store,
+    url: normalizeProductUrl(url || baseProd.url, store),
+    inStock: Boolean(inStock),
+    stockStatus: stockStatus || (inStock ? "in_stock" : "out_of_stock"),
+    storeZone: String(storeZone || "").trim(),
+  };
+}
+
+export function parseStoreBrowserPayload({
+  rawContent = "",
+  cartItems = [],
+  browserItems = [],
+  url = "",
+  storeZone = "",
+}) {
+  const defaultStore = detectStoreFromUrl(url);
+  const itemsList =
+    Array.isArray(browserItems) && browserItems.length > 0 ? browserItems : cartItems;
+
+  if (Array.isArray(itemsList) && itemsList.length > 0) {
     const out = [];
-    for (const ci of cartItems) {
+    for (const ci of itemsList) {
       if (!ci?.name) continue;
       const qty = Math.max(1, Number(ci.qty) || 1);
       const rawLine = parseClpString(ci.linePrice);
-      const rawUnit = parseClpString(ci.unitPrice);
+      const rawUnit = parseClpString(ci.unitPrice) ?? parseClpString(ci.price);
       const pkgPrice = rawUnit || (rawLine ? Math.round(rawLine / qty) : undefined);
-      if (!pkgPrice) continue;
-      const prodUrl = ci.url || url || "https://www.lider.cl";
-      const idMatch = String(prodUrl).match(/\/(\d{6,20})(?:$|\?)/);
-      const id = ci.externalId || (idMatch ? idMatch[1] : `lider-cart-${Date.now()}-${out.length}`);
+      const itemStore = ci.store || detectStoreFromUrl(ci.url || url) || defaultStore;
+      const prodUrl = ci.url || url || `https://www.${STORES[itemStore]?.domain || "lider.cl"}`;
+      const idMatch = String(prodUrl).match(/\/(\d{6,20})(?:$|\?|\/)/);
+      const id = ci.externalId || (idMatch ? idMatch[1] : `${itemStore}-web-${Date.now()}-${out.length}`);
+      const isAvail = ci.inStock !== false;
+      // Si está agotado y no tiene precio en página, permitir guardar registro con 0 para marcar agotado si trae SKU/URL
+      if (!pkgPrice && isAvail) continue;
       const bundleParsed = ci.promoText ? parseBundle(ci.promoText) : null;
-      const prod = buildNormalizedLiderProduct({
+      const prod = buildNormalizedBrowserProduct({
+        store: itemStore,
         id,
         name: ci.name,
         brand: ci.brand || "",
-        price: pkgPrice,
+        price: pkgPrice || 1,
         listPrice: parseClpString(ci.listPrice),
         promoText: bundleParsed?.description || ci.promoText || null,
         bundlePricePerItem: bundleParsed?.unitPriceInBundle ?? null,
         imageUrl: ci.imageUrl || "",
         url: prodUrl,
+        inStock: isAvail,
+        stockStatus: ci.stockStatus || (isAvail ? "in_stock" : "out_of_stock"),
+        storeZone: ci.storeZone || storeZone || "",
       });
-      prod.cartQuantity = qty;
+      if (!pkgPrice && !isAvail) prod.priceMissingBecauseOutOfStock = true;
+      if (ci.fromCart) prod.cartQuantity = qty;
       out.push(prod);
     }
     if (out.length > 0) return out;
   }
-  return parseLiderRawInput(rawContent, url);
+
+  // Fallback para PDP/HTML de Tottus u otras tiendas con __NEXT_DATA__
+  if (defaultStore === "tottus" && rawContent) {
+    const outText = String(rawContent);
+    const isOutDom = /justo se agot[oó]|producto agotado|sin stock disponible/i.test(outText);
+    const nextMatch = outText.match(NEXT_DATA_REGEX);
+    if (nextMatch) {
+      try {
+        const nd = JSON.parse(nextMatch[1]);
+        const pd = nd?.props?.pageProps?.productData;
+        if (pd?.displayName || pd?.name) {
+          const pName = pd.displayName || pd.name;
+          const v0 = pd.variants?.[0] || {};
+          const priceArr = v0.prices || pd.prices || [];
+          const pVal =
+            parseClpString(priceArr.find((x) => x.type === "internetPrice")?.price?.[0]) ??
+            parseClpString(priceArr[0]?.price?.[0]) ??
+            1;
+          const isAvail = !(isOutDom || pd.isOutOfStock === true || v0.isOutOfStock === true);
+          return [
+            buildNormalizedBrowserProduct({
+              store: "tottus",
+              id: v0.id || pd.id || pd.productId || "tottus-pdp",
+              name: pName,
+              brand: pd.brandName || pd.brand || "",
+              price: pVal,
+              url,
+              inStock: isAvail,
+              stockStatus: isAvail ? "in_stock" : "out_of_stock",
+              storeZone,
+            }),
+          ];
+        }
+      } catch {}
+    }
+  }
+
+  const parsedLider = parseLiderRawInput(rawContent, url);
+  return parsedLider.map((p) => ({
+    ...p,
+    stockStatus: p.inStock === false ? "out_of_stock" : "in_stock",
+    storeZone: storeZone || p.storeZone || "",
+  }));
+}
+
+export function parseLiderCartPayload({ rawContent = "", cartItems = [], browserItems = [], url = "", storeZone = "" }) {
+  const mappedCart = Array.isArray(cartItems)
+    ? cartItems.map((c) => ({ ...c, fromCart: true }))
+    : [];
+  return parseStoreBrowserPayload({
+    rawContent,
+    cartItems: mappedCart,
+    browserItems,
+    url,
+    storeZone,
+  });
 }
 
 function mapLiderItem(p, pageUrl = "") {
@@ -926,21 +1100,24 @@ export async function searchAllStores(query, options = {}) {
     limitPerStore = 15,
     minRelevance = 0.45,
     verifyLinks = true,
+    jumboStore = "",
+    includeOutOfStock = true,
   } = options;
 
   const translatedQuery = buildCrossStoreSearchQuery(query);
   const apiQuery = translatedQuery || query;
 
   const adapters = {
-    jumbo: (q) => searchCencosud("jumbo", q, limitPerStore),
-    santaisabel: (q) => searchCencosud("santaisabel", q, limitPerStore),
-    unimarc: (q) => searchUnimarc(q, limitPerStore),
+    jumbo: (q) => searchCencosud("jumbo", q, limitPerStore, { jumboStore, includeOutOfStock }),
+    santaisabel: (q) => searchCencosud("santaisabel", q, limitPerStore, { includeOutOfStock }),
+    unimarc: (q) => searchUnimarc(q, limitPerStore, { includeOutOfStock }),
     tottus: (q) => searchTottus(q, limitPerStore),
     lider: (q) => searchLider(q, limitPerStore),
   };
 
   const storeStatus = {};
   const allProducts = [];
+  const discoveredJumboSet = new Set();
 
   await Promise.all(
     stores.map(async (storeId) => {
@@ -959,6 +1136,9 @@ export async function searchAllStores(query, options = {}) {
           }
         }
         const enriched = items.map((item) => {
+          if (item.store === "jumbo" && Array.isArray(item.availableStores)) {
+            for (const sv of item.availableStores) discoveredJumboSet.add(sv);
+          }
           const purity = checkProductPurity(query, item.name, item.brand);
           const candText = `${item.name} ${item.brand || ""} ${item.formatLabel || ""}`;
           const relRaw = matchScore(query, candText);
@@ -983,8 +1163,12 @@ export async function searchAllStores(query, options = {}) {
 
         // Verificar que los links de Jumbo, Santa Isabel y Unimarc existan realmente (sin 404 fantasma)
         if (verifyLinks && ["jumbo", "santaisabel", "unimarc"].includes(storeId) && finalItems.length > 0) {
-          finalItems.sort((a, b) => a.unitPrice - b.unitPrice);
-          const toVerify = finalItems.slice(0, 6);
+          finalItems.sort(
+            (a, b) =>
+              (a.inStock === false ? 1 : 0) - (b.inStock === false ? 1 : 0) ||
+              a.unitPrice - b.unitPrice
+          );
+          const toVerify = finalItems.slice(0, 12);
           await Promise.all(
             toVerify.map(async (p) => {
               const chk = await verifyProductUrl(p.url, p.store);
@@ -1006,6 +1190,8 @@ export async function searchAllStores(query, options = {}) {
         storeStatus[storeId] = {
           ok: true,
           count: finalItems.length,
+          inStockCount: finalItems.filter((p) => p.inStock !== false).length,
+          outOfStockCount: finalItems.filter((p) => p.inStock === false).length,
           ms: Date.now() - t0,
         };
       } catch (err) {
@@ -1019,15 +1205,21 @@ export async function searchAllStores(query, options = {}) {
     })
   );
 
-  // Ordenar por mejor precio por unidad (kg/lt/un) por defecto
-  allProducts.sort((a, b) => a.unitPrice - b.unitPrice);
+  // Ordenar poniendo primero productos con stock y luego por mejor precio por unidad
+  allProducts.sort(
+    (a, b) =>
+      (a.inStock === false ? 1 : 0) - (b.inStock === false ? 1 : 0) ||
+      a.unitPrice - b.unitPrice
+  );
 
   // Detectar Falsos Packs Ahorro entre los resultados encontrados
-  const packTraps = detectPackTraps(allProducts);
+  const packTraps = detectPackTraps(allProducts.filter((p) => p.inStock !== false));
 
   return {
     query,
     fetchedAt: new Date().toISOString(),
+    jumboStore: jumboStore || null,
+    discoveredJumboStores: [...discoveredJumboSet].sort(),
     storeStatus,
     products: allProducts,
     packTraps,

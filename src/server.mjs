@@ -28,6 +28,7 @@ import {
   refreshCartPrices,
   removeCartItem,
   seedDefaultCartIfNeeded,
+  syncBrowserOffersToCarts,
   updateCartCriteria,
   updateCartItem,
   updateCartItemLiderOffer,
@@ -48,6 +49,7 @@ import {
   fetchProductByUrl,
   parseLiderCartPayload,
   parseLiderRawInput,
+  parseStoreBrowserPayload,
   searchAllStores,
   STORES,
   verifyProductUrl,
@@ -274,8 +276,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, { ok: true });
     }
 
-    // Importador de Lider: permite sesión autenticada o token firmado en URL del Bookmarklet
-    if (pathname === "/api/import-lider" && method === "POST") {
+    // Importador Multi-Supermercado desde navegador: Lider, Tottus, Jumbo, Santa Isabel, Unimarc
+    if ((pathname === "/api/import-lider" || pathname === "/api/import-browser") && method === "POST") {
       if (!isImportAuthorized(req, urlObj)) {
         return sendJson(res, 401, {
           error: "Token de Bookmarklet inválido o sesión no autenticada.",
@@ -283,7 +285,8 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readJsonBody(req);
       let cartItems = Array.isArray(body.cartItems) ? body.cartItems : [];
-      if (cartItems.length === 0 && typeof body.rawContent === "string") {
+      const browserItems = Array.isArray(body.browserItems) ? body.browserItems : [];
+      if (cartItems.length === 0 && browserItems.length === 0 && typeof body.rawContent === "string") {
         const trimmedRaw = body.rawContent.trim();
         if (trimmedRaw.startsWith("{") || trimmedRaw.startsWith("[")) {
           try {
@@ -297,18 +300,31 @@ const server = http.createServer(async (req, res) => {
         }
       }
 
-      const products = parseLiderCartPayload({
-        rawContent: body.rawContent || "",
-        cartItems,
-        url: body.url || "",
-      });
+      const products =
+        browserItems.length > 0
+          ? parseStoreBrowserPayload({
+              rawContent: body.rawContent || "",
+              cartItems,
+              browserItems,
+              url: body.url || "",
+              storeZone: body.storeZone || "",
+            })
+          : parseLiderCartPayload({
+              rawContent: body.rawContent || "",
+              cartItems,
+              url: body.url || "",
+              storeZone: body.storeZone || "",
+            });
 
       if (products.length === 0) {
         return sendJson(res, 400, {
           error:
-            "No se encontraron productos de Lider en el contenido pegado. Asegúrate de copiar el carrito (/cart), la búsqueda o ficha de producto.",
+            "No se encontraron productos en la página o texto pegado. Abre una búsqueda, carrito (/cart) o ficha de producto.",
         });
       }
+
+      // Sincronizar disponibilidad/stock por zona en carritos existentes (ej. Tottus agotado en Viña del Mar)
+      syncBrowserOffersToCarts(products);
 
       const isCartMode =
         body.mode === "cart" ||
@@ -459,6 +475,8 @@ const server = http.createServer(async (req, res) => {
         settings: {
           autoIntervalMinutes: Number(getSetting("auto_interval_minutes", "360")),
           lastAutoRunAt: getSetting("last_auto_run_at", null),
+          preferredJumboStore: getSetting("preferred_jumbo_store", ""),
+          preferredCommuneLabel: getSetting("preferred_commune_label", "Viña del Mar"),
         },
       });
     }
@@ -477,11 +495,18 @@ const server = http.createServer(async (req, res) => {
             .filter(Boolean)
         : ["jumbo", "santaisabel", "unimarc", "tottus"];
 
+      const jumboStore =
+        urlObj.searchParams.get("jumboStore") !== null
+          ? urlObj.searchParams.get("jumboStore").trim()
+          : getSetting("preferred_jumbo_store", "");
+
       const limit = Number(urlObj.searchParams.get("limit") || 18);
       const data = await searchAllStores(q, {
         stores,
         limitPerStore: limit,
         minRelevance: 0.35,
+        jumboStore,
+        includeOutOfStock: true,
       });
       return sendJson(res, 200, data);
     }
@@ -814,16 +839,24 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, resTele.ok ? 200 : 400, resTele);
     }
 
-    // 11. Guardar ajustes del programador automático
+    // 11. Guardar ajustes del programador automático y tienda geográfica
     if (pathname === "/api/settings" && method === "POST") {
       const body = await readJsonBody(req);
       if (body.autoIntervalMinutes !== undefined) {
         setSetting("auto_interval_minutes", String(Number(body.autoIntervalMinutes)));
         setupAutoScheduler();
       }
+      if (body.preferredJumboStore !== undefined) {
+        setSetting("preferred_jumbo_store", String(body.preferredJumboStore || "").trim());
+      }
+      if (body.preferredCommuneLabel !== undefined) {
+        setSetting("preferred_commune_label", String(body.preferredCommuneLabel || "").trim());
+      }
       return sendJson(res, 200, {
         autoIntervalMinutes: Number(getSetting("auto_interval_minutes", "360")),
         lastAutoRunAt: getSetting("last_auto_run_at", null),
+        preferredJumboStore: getSetting("preferred_jumbo_store", ""),
+        preferredCommuneLabel: getSetting("preferred_commune_label", "Viña del Mar"),
       });
     }
 

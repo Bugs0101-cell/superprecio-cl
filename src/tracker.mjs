@@ -42,6 +42,7 @@ export async function refreshTrackedItem(trackedItemId) {
   if (!item) throw new Error(`Producto seguido #${trackedItemId} no existe`);
 
   const now = new Date().toISOString();
+  const preferredJumboStore = getSetting("preferred_jumbo_store", "");
   const coveredStores = new Set();
   const newlyInsertedStores = new Set();
   const savedSnapshots = [];
@@ -55,6 +56,8 @@ export async function refreshTrackedItem(trackedItemId) {
         stores: [pinned.store],
         limitPerStore: 10,
         minRelevance: 0.2,
+        jumboStore: preferredJumboStore,
+        includeOutOfStock: true,
       });
 
       const match =
@@ -90,6 +93,8 @@ export async function refreshTrackedItem(trackedItemId) {
         limitPerStore: 15,
         minRelevance: 0.45,
         verifyLinks: true,
+        jumboStore: preferredJumboStore,
+        includeOutOfStock: true,
       });
 
       const targetUnit = detectDominantUnit(res.products, item.preferred_unit);
@@ -108,9 +113,15 @@ export async function refreshTrackedItem(trackedItemId) {
         );
         if (pureItems.length === 0) continue;
 
+        // Priorizar productos CON STOCK (excluir agotados cuando exista alternativa disponible)
+        const inStockPure = pureItems.filter(
+          (p) => p.inStock !== false && p.stockStatus !== "out_of_stock"
+        );
+        const stockFiltered = inStockPure.length > 0 ? inStockPure : pureItems;
+
         // Priorizar productos 100% puros (no mezclas) si existen en esa tienda
-        const nonBlend = pureItems.filter((p) => !p.isBlend);
-        let preferredPool = nonBlend.length > 0 ? nonBlend : pureItems;
+        const nonBlend = stockFiltered.filter((p) => !p.isBlend);
+        let preferredPool = nonBlend.length > 0 ? nonBlend : stockFiltered;
 
         // Si tenemos referencia de gramaje/volumen (ej. sobre 15g o 76g), evitar formatos 10x distintos
         if (refSpec && refSpec.baseAmount > 0) {
@@ -126,22 +137,34 @@ export async function refreshTrackedItem(trackedItemId) {
         const unitMatched = preferredPool.filter((p) => p.unit === targetUnit);
         const candidates = unitMatched.length > 0 ? unitMatched : preferredPool;
 
-        // Elegir el más económico considerando precio regular o efectivo por promo
+        // Elegir el más económico considerando stock primero y precio regular o efectivo por promo
         candidates.sort(
           (a, b) =>
+            (a.inStock === false ? 1 : 0) - (b.inStock === false ? 1 : 0) ||
             Math.min(a.effectiveUnitPrice || a.unitPrice, a.unitPrice) -
-            Math.min(b.effectiveUnitPrice || b.unitPrice, b.unitPrice)
+              Math.min(b.effectiveUnitPrice || b.unitPrice, b.unitPrice)
         );
         const best = candidates[0];
 
         if (best) {
-          const snapRes = touchOrInsertSnapshot({
-            trackedItemId: item.id,
-            pinnedProductId: null,
-            product: best,
-            recordedAt: now,
-          });
-          if (snapRes?.inserted) newlyInsertedStores.add(storeId);
+          // Respetar si el usuario ya reportó este mismo SKU agotado por zona en las últimas 24h cuando la API nacional viene sin ubicación
+          const prevSnap = item.latestByStore?.[storeId];
+          const prevOutRecent =
+            prevSnap &&
+            prevSnap.stock_status === "out_of_stock" &&
+            String(prevSnap.external_id) === String(best.externalId) &&
+            best.stockStatus === "unverified_zone" &&
+            Date.now() - new Date(prevSnap.recorded_at).getTime() < 24 * 60 * 60 * 1000;
+
+          if (!prevOutRecent) {
+            const snapRes = touchOrInsertSnapshot({
+              trackedItemId: item.id,
+              pinnedProductId: null,
+              product: best,
+              recordedAt: now,
+            });
+            if (snapRes?.inserted) newlyInsertedStores.add(storeId);
+          }
           savedSnapshots.push(best);
         }
       }
@@ -162,7 +185,9 @@ export async function refreshTrackedItem(trackedItemId) {
       for (const [storeId, vStat] of Object.entries(updatedItem.variabilityByStore || {})) {
         if (!newlyInsertedStores.has(storeId)) continue;
         const latestSnap = updatedItem.latestByStore?.[storeId];
-        if (!latestSnap) continue;
+        if (!latestSnap || latestSnap.in_stock === false || latestSnap.stock_status === "out_of_stock") {
+          continue;
+        }
 
         const isPctDrop = vStat && vStat.deltaPrevPct <= -thresholdPct;
         const isTargetHit =
