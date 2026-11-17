@@ -9,6 +9,8 @@ import {
   estimateProteinMetrics,
   extractQuantityFromText,
   inferBrand,
+  normalizeProductUrl,
+  parseBundle,
 } from "./normalizer.mjs";
 import { searchAllStores, STORES } from "./scrapers.mjs";
 
@@ -69,6 +71,18 @@ function toCartCandidate(p, storeOverride = null) {
   const brand = inferBrand(p.name, p.brand);
   const nut = estimateProteinMetrics(p.name, unit, baseAmount, p.price, brand);
 
+  const bundle = p.promoText ? parseBundle(p.promoText) : null;
+  const promoUnitPrice =
+    p.bundlePricePerItem ||
+    (bundle?.unitPriceInBundle && bundle.unitPriceInBundle < p.price
+      ? bundle.unitPriceInBundle
+      : null);
+  const promoMinQty = promoUnitPrice ? bundle?.minQuantity || 2 : null;
+  const effectiveUnitPrice =
+    promoUnitPrice && baseAmount > 0
+      ? Math.round(promoUnitPrice / baseAmount)
+      : p.effectiveUnitPrice || p.unitPrice;
+
   return {
     externalId: String(p.externalId || p.sku),
     sku: String(p.sku || p.externalId),
@@ -77,11 +91,13 @@ function toCartCandidate(p, storeOverride = null) {
     brand,
     price: p.price,
     listPrice: p.listPrice || null,
-    bundlePricePerItem: p.bundlePricePerItem || null,
+    bundlePricePerItem: promoUnitPrice,
+    promoMinQty,
+    promoBundlePrice: bundle?.bundlePrice || null,
     promoText: p.promoText || null,
     unit,
     unitPrice: p.unitPrice,
-    effectiveUnitPrice: p.effectiveUnitPrice || p.unitPrice,
+    effectiveUnitPrice,
     baseAmount,
     formatLabel: p.formatLabel || `1 ${unit}`,
     pricePer100: p.pricePer100 || Math.round(p.unitPrice / 10),
@@ -92,19 +108,39 @@ function toCartCandidate(p, storeOverride = null) {
     nutritionScore: nut.nutritionScore,
     nutritionGrade: nut.nutritionGrade,
     nutritionBadge: nut.nutritionBadge,
-    url: p.url || "",
+    linkStatus: p.linkStatus || "unknown",
+    url: normalizeProductUrl(p.url || "", store),
     imageUrl: p.imageUrl || "",
   };
 }
 
-function enrichCartCandidate(c, searchQuery) {
+function enrichCartCandidate(c, searchQuery, storeOverride = null) {
   getCandidateSpec(c);
+  const store = storeOverride || c.store;
   const brand = inferBrand(c.name, c.brand);
   const nut = estimateProteinMetrics(c.name, c.unit, c.baseAmount, c.price, brand);
   const purity = checkProductPurity(searchQuery, c.name, brand);
+  const bundle = c.promoText ? parseBundle(c.promoText) : null;
+  const promoUnitPrice =
+    c.bundlePricePerItem ||
+    (bundle?.unitPriceInBundle && bundle.unitPriceInBundle < c.price
+      ? bundle.unitPriceInBundle
+      : null);
+  const promoMinQty = c.promoMinQty || (promoUnitPrice ? bundle?.minQuantity || 2 : null);
+  const effectiveUnitPrice =
+    promoUnitPrice && c.baseAmount > 0
+      ? Math.round(promoUnitPrice / c.baseAmount)
+      : c.effectiveUnitPrice || c.unitPrice;
+
   return {
     ...c,
+    store,
     brand,
+    bundlePricePerItem: promoUnitPrice,
+    promoMinQty,
+    promoBundlePrice: c.promoBundlePrice || bundle?.bundlePrice || null,
+    effectiveUnitPrice,
+    url: normalizeProductUrl(c.url || "", store),
     hasProteinData: nut.hasProteinData,
     proteinGramsTotal: nut.proteinGramsTotal,
     proteinPer100g: nut.proteinPer100g,
@@ -145,6 +181,7 @@ export async function fetchCandidatesForCartQuery(searchQuery, preferredUnit = "
     stores: AUTO_STORES,
     limitPerStore: 14,
     minRelevance: 0.4,
+    verifyLinks: true,
   });
 
   const targetUnit = detectDominantUnit(res.products, preferredUnit);
@@ -172,12 +209,19 @@ function computeLinePricing(candidate, quantity) {
   let lineTotal = unitPackagePrice * qty;
   let appliedPromo = false;
 
+  const minQty = candidate.promoMinQty || 2;
   if (
     candidate.bundlePricePerItem &&
     candidate.bundlePricePerItem < unitPackagePrice &&
-    qty >= 2
+    qty >= minQty
   ) {
-    lineTotal = candidate.bundlePricePerItem * qty;
+    if (candidate.promoBundlePrice && minQty >= 2) {
+      const packs = Math.floor(qty / minQty);
+      const rem = qty % minQty;
+      lineTotal = packs * candidate.promoBundlePrice + rem * unitPackagePrice;
+    } else {
+      lineTotal = candidate.bundlePricePerItem * qty;
+    }
     appliedPromo = true;
   }
 
@@ -208,6 +252,11 @@ function compareByCartCriteria(prodA, prodB, lineA, lineB, criteria) {
   const pureB = prodB.isPure !== false ? 0 : 1;
   if (pureA !== pureB) return pureA - pureB;
 
+  if (criteria === "effective_unit_price") {
+    const eA = prodA.effectiveUnitPrice || prodA.unitPrice || 0;
+    const eB = prodB.effectiveUnitPrice || prodB.unitPrice || 0;
+    return eA - eB || lineA - lineB;
+  }
   if (criteria === "protein_price") {
     const pA = prodA.pricePer10gProtein || 9999999;
     const pB = prodB.pricePer10gProtein || 9999999;
@@ -300,7 +349,7 @@ export function evaluateCart(cartRow) {
         : [];
       if (rawCandidates.length === 0) continue;
 
-      const candidates = rawCandidates.map((c) => enrichCartCandidate(c, qCheck));
+      const candidates = rawCandidates.map((c) => enrichCartCandidate(c, qCheck, storeId));
 
       // Ordenar priorizando equivalencia de pureza, formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
       candidates.sort((a, b) => {

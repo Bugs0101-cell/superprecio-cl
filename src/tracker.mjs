@@ -6,7 +6,11 @@ import {
   listTrackedItems,
   setSetting,
 } from "./db.mjs";
-import { checkProductPurity } from "./normalizer.mjs";
+import {
+  buildCrossStoreSearchQuery,
+  checkProductPurity,
+  extractQuantityFromText,
+} from "./normalizer.mjs";
 import { searchAllStores, STORES } from "./scrapers.mjs";
 import { formatPriceAlertMessage, sendTelegramNotification } from "./telegram.mjs";
 
@@ -78,14 +82,17 @@ export async function refreshTrackedItem(trackedItemId) {
   if ((item.mode === "mixed" || item.mode === "query") && item.search_query) {
     const remainingStores = AUTO_STORES.filter((s) => !coveredStores.has(s));
     if (remainingStores.length > 0) {
-      const res = await searchAllStores(item.search_query, {
+      const searchQ = buildCrossStoreSearchQuery(item.search_query) || item.search_query;
+      const res = await searchAllStores(searchQ, {
         stores: remainingStores,
         limitPerStore: 15,
-        minRelevance: 0.5,
+        minRelevance: 0.45,
+        verifyLinks: true,
       });
 
       const targetUnit = detectDominantUnit(res.products, item.preferred_unit);
       const qCheck = item.search_query || item.title;
+      const refSpec = extractQuantityFromText(qCheck, "");
 
       for (const storeId of remainingStores) {
         const storeItems = res.products.filter((p) => p.store === storeId);
@@ -94,20 +101,35 @@ export async function refreshTrackedItem(trackedItemId) {
         const pureItems = storeItems.filter(
           (p) =>
             p.isPure !== false &&
+            p.linkStatus !== "broken" &&
             checkProductPurity(qCheck, p.name, p.brand).isPure !== false
         );
         if (pureItems.length === 0) continue;
 
         // Priorizar productos 100% puros (no mezclas) si existen en esa tienda
         const nonBlend = pureItems.filter((p) => !p.isBlend);
-        const preferredPool = nonBlend.length > 0 ? nonBlend : pureItems;
+        let preferredPool = nonBlend.length > 0 ? nonBlend : pureItems;
+
+        // Si tenemos referencia de gramaje/volumen (ej. sobre 15g o 76g), evitar formatos 10x distintos
+        if (refSpec && refSpec.baseAmount > 0) {
+          const nearSize = preferredPool.filter((p) => {
+            if (p.unit !== refSpec.unit || !p.baseAmount) return true;
+            const ratio = Math.max(p.baseAmount / refSpec.baseAmount, refSpec.baseAmount / p.baseAmount);
+            return ratio <= 4;
+          });
+          if (nearSize.length > 0) preferredPool = nearSize;
+        }
 
         // Filtrar por la misma unidad (kg o lt) para comparar justamente $/kg o $/L
         const unitMatched = preferredPool.filter((p) => p.unit === targetUnit);
         const candidates = unitMatched.length > 0 ? unitMatched : preferredPool;
 
-        // Elegir el más económico por unidad ($/kg, $/L, $/un)
-        candidates.sort((a, b) => a.unitPrice - b.unitPrice);
+        // Elegir el más económico considerando precio regular o efectivo por promo
+        candidates.sort(
+          (a, b) =>
+            Math.min(a.effectiveUnitPrice || a.unitPrice, a.unitPrice) -
+            Math.min(b.effectiveUnitPrice || b.unitPrice, b.unitPrice)
+        );
         const best = candidates[0];
 
         if (best) {

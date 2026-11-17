@@ -124,9 +124,45 @@ export function parseUnitPriceString(value) {
  * - Medidas simples: "1 kg", "900 g", "250 grs", "1,5 L", "900 ml", "500 cc"
  * - Unidades discretas: "30 un", "12 unidades", "100 bolsitas", "8 rollos"
  */
+export function normalizeProductUrl(rawUrl = "", store = "") {
+  const url = String(rawUrl || "").trim();
+  if (!url || url === "#") return "";
+  if (store === "santaisabel" || /sisa\.cl/i.test(url)) {
+    return url.replace(/^https?:\/\/(?:www\.)?sisa\.cl/i, "https://www.santaisabel.cl");
+  }
+  if (store === "unimarc" || /unimarc\.cl\/product\//i.test(url)) {
+    return url.replace(/\/product(\/[^?#]+?)\/p(?=$|[?#])/i, "/product$1");
+  }
+  return url;
+}
+
+/**
+ * Traduce nombres internos de Lider/Walmart u otros supermercados a búsquedas limpias
+ * compatibles con Jumbo, Santa Isabel, Unimarc y Tottus.
+ */
+export function buildCrossStoreSearchQuery(rawQuery = "") {
+  let q = normalizeText(rawQuery);
+  if (!q) return "";
+  q = q
+    .replace(/\(\s*\d+\s*porciones?\s*\)/gi, " ")
+    .replace(/\brefresco\s+sabor\b/gi, "jugo en polvo")
+    .replace(/\brefresco\b/gi, "jugo en polvo")
+    .replace(/\b(?:sobre|doypack|botella|bolsa)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return q || String(rawQuery).trim();
+}
+
 export function extractQuantityFromText(name = "", formatStr = "") {
   const combined = `${name} ${formatStr}`.trim();
-  const norm = normalizeText(combined);
+  const norm = normalizeText(combined)
+    .replace(
+      /\b(?:rinde|para\s+preparar|prepara|equivalente\s+a)\s*\d+(?:[.,]\d+)?\s*(?:lt|lts|l|litro|litros|ml|cc)\b/gi,
+      " "
+    )
+    .replace(/\b\d+\s*porciones?\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 
   // 1. Multipacks con peso/volumen: ej. "6 x 200 ml", "12 un de 90 g", "6x1.5 l"
   const multiMatch = norm.match(
@@ -290,7 +326,7 @@ export function parseBundle(text) {
   const desc = text.trim().replace(/\s+/g, " ");
   if (desc.length === 0) return undefined;
 
-  const bundle = desc.match(/(?:combina|lleva)?\s*(\d+)\s*(?:x|por)\s*\$\s*([\d.]+)/i);
+  const bundle = desc.match(/(?:combina|lleva|agrega)?\s*(\d+)\s*(?:x|por)\s*\$\s*([\d.]+)/i);
   if (bundle) {
     const minQuantity = Number(bundle[1]);
     const bundlePrice = Number(bundle[2].replace(/\./g, ""));
@@ -464,6 +500,9 @@ const STRICT_MODIFIER_TOKENS = new Set([
   "pechuga",
   "churrasco",
   "molida",
+  "sopa",
+  "caracolito",
+  "caracolitos",
   "higienico",
   "basura",
   "detergente",
@@ -559,7 +598,36 @@ export function checkProductPurity(query = "", candidateName = "", candidateBran
     }
   }
 
-  // 3. Cortes / Variedades críticas
+  // 3. Refrescos / Jugos en Polvo: no mezclar con frutas congeladas, néctares líquidos ni caramelos
+  if (/\b(?:refresco|jugo\s+en\s+polvo|zuko|livean|sprim)\b/.test(q)) {
+    if (
+      /\b(mango|frutilla\s+congelada|caramelo|chupone?s|manjar|barra\s+de\s+fruta|compota|saborizante|cola\s+cao|agua\s+saborizada|limonada\s+.*1\s*l|nectar|gaseosa|fanta|bebida\s+.*1\.\d|500\s*g|180\s*g)\b/.test(
+        c
+      )
+    ) {
+      return {
+        isPure: false,
+        isBlend: false,
+        purityTier: "mismatch",
+        purityWarning: "⚠️ No es jugo en polvo en sobre (es fruta/líquido/dulce)",
+        penaltyFactor: 0.15,
+      };
+    }
+    const isPowderMatch = /\b(polvo|zuko|livean|sprim|vivo|instantane[oa]|refresco|bebida\s+instantanea)\b/.test(
+      c
+    );
+    if (!isPowderMatch) {
+      return {
+        isPure: false,
+        isBlend: false,
+        purityTier: "mismatch",
+        purityWarning: "⚠️ No es jugo en polvo equivalente",
+        penaltyFactor: 0.2,
+      };
+    }
+  }
+
+  // 4. Cortes / Variedades críticas
   if (/\bduquesa\b/.test(q) && !/\bduquesa\b/.test(c)) {
     return {
       isPure: false,

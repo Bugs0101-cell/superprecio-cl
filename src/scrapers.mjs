@@ -1,17 +1,101 @@
 import { randomUUID } from "node:crypto";
 import {
+  buildCrossStoreSearchQuery,
   checkProductPurity,
   detectPackTraps,
   enrichUnitMetrics,
   estimateProteinMetrics,
   inferBrand,
   matchScore,
+  normalizeProductUrl,
   normalizeUnit,
   parseBundle,
   parseClpString,
   parseUnitPriceString,
   toClp,
 } from "./normalizer.mjs";
+
+const URL_CHECK_CACHE = new Map();
+const URL_CACHE_TTL_MS = 30 * 60 * 1000;
+
+export async function verifyProductUrl(rawUrl, store = "") {
+  const url = normalizeProductUrl(rawUrl, store);
+  if (!url || !/^https?:\/\//i.test(url)) {
+    return { ok: false, status: "broken", httpStatus: 0, url: "" };
+  }
+
+  const cached = URL_CHECK_CACHE.get(url);
+  if (cached && Date.now() - cached.checkedAt < URL_CACHE_TTL_MS) {
+    return cached.result;
+  }
+
+  const recordResult = (result) => {
+    if (URL_CHECK_CACHE.size > 600) URL_CHECK_CACHE.clear();
+    URL_CHECK_CACHE.set(url, { checkedAt: Date.now(), result });
+    return result;
+  };
+
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9",
+      },
+      redirect: "manual",
+      signal: AbortSignal.timeout(4500),
+    });
+
+    if (res.status === 404 || res.status === 410) {
+      return recordResult({ ok: false, status: "broken", httpStatus: res.status, url });
+    }
+
+    if (res.status >= 300 && res.status < 400) {
+      const loc = res.headers.get("location") || "";
+      if (/\/404(?:$|[/?#])/i.test(loc)) {
+        return recordResult({ ok: false, status: "broken", httpStatus: 404, url });
+      }
+      if (loc) {
+        const nextUrl = loc.startsWith("http") ? loc : new URL(loc, url).href;
+        const r2 = await fetch(nextUrl, {
+          method: "GET",
+          headers: { "User-Agent": USER_AGENT, Accept: "text/html" },
+          redirect: "manual",
+          signal: AbortSignal.timeout(4000),
+        });
+        if (r2.status === 404 || r2.status === 410) {
+          return recordResult({ ok: false, status: "broken", httpStatus: r2.status, url });
+        }
+        if (r2.status === 200) {
+          return recordResult({ ok: true, status: "ok", httpStatus: 200, url: nextUrl });
+        }
+      }
+    }
+
+    if (res.status === 403 || res.status === 412 || res.status === 429) {
+      return recordResult({ ok: true, status: "protected", httpStatus: res.status, url });
+    }
+
+    if (res.status === 200) {
+      const snippet = (await res.text()).slice(0, 12000);
+      if (
+        /robot or human|perimeterx|px-captcha/i.test(snippet) &&
+        store === "lider"
+      ) {
+        return recordResult({ ok: true, status: "protected", httpStatus: 200, url });
+      }
+      if (/<title>[^<]*404|p[áa]gina\s+no\s+encontrada|product(?:o)?\s+no\s+(?:encontrado|disponible)/i.test(snippet)) {
+        return recordResult({ ok: false, status: "broken", httpStatus: 404, url });
+      }
+      return recordResult({ ok: true, status: "ok", httpStatus: 200, url });
+    }
+
+    return recordResult({ ok: true, status: "unknown", httpStatus: res.status, url });
+  } catch {
+    return recordResult({ ok: true, status: "unknown", httpStatus: 0, url });
+  }
+}
 
 function resolveBrandAndNutrition(name, rawBrand, unitMetrics, price) {
   const brand = inferBrand(name, rawBrand);
@@ -190,10 +274,8 @@ function mapCencosudItem(cfg, result) {
       ? Math.round(bundle.unitPriceInBundle / unitMetrics.baseAmount)
       : unitMetrics.unitPrice;
 
-  const rawUrl = data.url;
-  const detailUrl = data.DetailUrl;
-  const productUrl =
-    rawUrl || (detailUrl ? `${cfg.siteBaseUrl}${detailUrl}` : `${cfg.siteBaseUrl}`);
+  const rawUrl = data.DetailUrl ? `${cfg.siteBaseUrl}${data.DetailUrl}` : data.url || cfg.siteBaseUrl;
+  const productUrl = normalizeProductUrl(rawUrl, cfg.storeId);
 
   const nutFields = resolveBrandAndNutrition(name, data.BrandName, unitMetrics, price);
 
@@ -303,9 +385,10 @@ function mapUnimarcItem(p) {
       ? Math.round(bundleUnitPrice / unitMetrics.baseAmount)
       : unitMetrics.unitPrice;
 
-  const productUrl = item.slug
+  const rawUrl = item.slug
     ? `https://www.unimarc.cl/product${item.slug.startsWith("/") ? item.slug : "/" + item.slug}`
     : "https://www.unimarc.cl";
+  const productUrl = normalizeProductUrl(rawUrl, "unimarc");
 
   const nutFields = resolveBrandAndNutrition(item.name, item.brand, unitMetrics, price);
 
@@ -514,6 +597,10 @@ function buildNormalizedLiderProduct({
   });
 
   const nutFields = resolveBrandAndNutrition(name, brand, unitMetrics, price);
+  const effectiveUnitPrice =
+    bundlePricePerItem && unitMetrics.baseAmount > 0
+      ? Math.round(bundlePricePerItem / unitMetrics.baseAmount)
+      : unitMetrics.unitPrice;
 
   return {
     store: "lider",
@@ -528,7 +615,7 @@ function buildNormalizedLiderProduct({
     bundlePricePerItem,
     unit: unitMetrics.unit,
     unitPrice: unitMetrics.unitPrice,
-    effectiveUnitPrice: unitMetrics.unitPrice,
+    effectiveUnitPrice,
     baseAmount: unitMetrics.baseAmount,
     formatLabel: unitMetrics.formatLabel,
     pricePer100: unitMetrics.pricePer100,
@@ -749,7 +836,11 @@ export async function searchAllStores(query, options = {}) {
     stores = ["jumbo", "santaisabel", "unimarc", "tottus"],
     limitPerStore = 15,
     minRelevance = 0.45,
+    verifyLinks = true,
   } = options;
+
+  const translatedQuery = buildCrossStoreSearchQuery(query);
+  const apiQuery = translatedQuery || query;
 
   const adapters = {
     jumbo: (q) => searchCencosud("jumbo", q, limitPerStore),
@@ -768,15 +859,27 @@ export async function searchAllStores(query, options = {}) {
       if (!fn) return;
       const t0 = Date.now();
       try {
-        const items = await fn(query);
+        let items = await fn(apiQuery);
+        if (items.length === 0) {
+          const relaxedQuery = apiQuery
+            .replace(/\b\d+(?:[.,]\d+)?\s*(?:g|gr|grs|ml|cc|kg|lts|lt|l|un|und)\b/gi, " ")
+            .replace(/\s+/g, " ")
+            .trim();
+          if (relaxedQuery && relaxedQuery !== apiQuery && relaxedQuery.length >= 4) {
+            items = await fn(relaxedQuery);
+          }
+        }
         const enriched = items.map((item) => {
           const purity = checkProductPurity(query, item.name, item.brand);
+          const candText = `${item.name} ${item.brand || ""} ${item.formatLabel || ""}`;
+          const relRaw = matchScore(query, candText);
+          const relTrans = apiQuery !== query ? matchScore(apiQuery, candText) : relRaw;
           return {
             ...item,
             isPure: purity.isPure,
             isBlend: purity.isBlend,
             purityWarning: purity.purityWarning,
-            relevance: matchScore(query, `${item.name} ${item.brand || ""} ${item.formatLabel || ""}`),
+            relevance: Math.max(relRaw, relTrans),
           };
         });
         const scored = enriched.filter((item) => item.relevance >= minRelevance);
@@ -787,7 +890,29 @@ export async function searchAllStores(query, options = {}) {
           .slice(0, 5)
           .map((i) => ({ ...i, relevance: Math.max(0.4, i.relevance || 0) }));
 
-        const finalItems = scored.length > 0 ? scored : pureFallback;
+        let finalItems = scored.length > 0 ? scored : pureFallback;
+
+        // Verificar que los links de Jumbo, Santa Isabel y Unimarc existan realmente (sin 404 fantasma)
+        if (verifyLinks && ["jumbo", "santaisabel", "unimarc"].includes(storeId) && finalItems.length > 0) {
+          finalItems.sort((a, b) => a.unitPrice - b.unitPrice);
+          const toVerify = finalItems.slice(0, 6);
+          await Promise.all(
+            toVerify.map(async (p) => {
+              const chk = await verifyProductUrl(p.url, p.store);
+              p.linkStatus = chk.status;
+              p.linkHttpStatus = chk.httpStatus;
+              if (chk.url) p.url = chk.url;
+            })
+          );
+          if (!options.keepBrokenLinks) {
+            finalItems = finalItems.filter((p) => p.linkStatus !== "broken");
+          }
+        } else {
+          for (const p of finalItems) {
+            if (!p.linkStatus) p.linkStatus = storeId === "tottus" ? "protected" : "unknown";
+          }
+        }
+
         allProducts.push(...finalItems);
         storeStatus[storeId] = {
           ok: true,

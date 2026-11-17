@@ -35,12 +35,17 @@ import {
   getTodayDayIndex,
   getWeekdayName,
 } from "./discounts.mjs";
-import { enrichUnitMetrics, matchScore } from "./normalizer.mjs";
+import {
+  buildCrossStoreSearchQuery,
+  enrichUnitMetrics,
+  matchScore,
+} from "./normalizer.mjs";
 import {
   fetchProductByUrl,
   parseLiderRawInput,
   searchAllStores,
   STORES,
+  verifyProductUrl,
 } from "./scrapers.mjs";
 import { sendTelegramNotification } from "./telegram.mjs";
 import {
@@ -295,9 +300,10 @@ const server = http.createServer(async (req, res) => {
 
         if (matchedTitles.length === 0 && products.length > 0) {
           const bestProd = products[0];
+          const cleanQuery = buildCrossStoreSearchQuery(bestProd.name) || bestProd.name;
           const newId = createTrackedItem({
             title: bestProd.name,
-            searchQuery: bestProd.name,
+            searchQuery: cleanQuery,
             mode: "mixed",
             preferredUnit: bestProd.unit || "auto",
             category: "Despensa",
@@ -330,6 +336,21 @@ const server = http.createServer(async (req, res) => {
         authEnabled: Boolean(ACCESS_PASSWORD),
         importToken: ACCESS_PASSWORD ? signToken("import-lider") : null,
       });
+    }
+
+    // Verificador en vivo de links de productos (detecta 404 vs 200 OK vs Antibot)
+    if (pathname === "/api/verify-links" && method === "POST") {
+      const body = await readJsonBody(req);
+      const links = Array.isArray(body.links) ? body.links.slice(0, 60) : [];
+      const results = {};
+      await Promise.all(
+        links.map(async (entry) => {
+          const key = entry?.key || entry?.url;
+          if (!key || !entry?.url) return;
+          results[key] = await verifyProductUrl(entry.url, entry.store || "");
+        })
+      );
+      return sendJson(res, 200, { results });
     }
 
     // 1. Metadata de tiendas y configuración

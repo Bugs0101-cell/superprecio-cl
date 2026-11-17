@@ -7,6 +7,8 @@ import {
   estimateProteinMetrics,
   extractQuantityFromText,
   inferBrand,
+  normalizeProductUrl,
+  parseBundle,
 } from "./normalizer.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -372,10 +374,26 @@ export function enrichTrackedItemWithStats(item) {
       latest.product_name,
       brandClean
     );
+    const bundle = latest.promo_text ? parseBundle(latest.promo_text) : null;
+    const promoUnitPrice =
+      bundle?.unitPriceInBundle && bundle.unitPriceInBundle < latest.price
+        ? bundle.unitPriceInBundle
+        : null;
+    const promoMinQty = promoUnitPrice ? bundle.minQuantity : null;
+    const effectiveUnitPrice =
+      promoUnitPrice && baseAmt > 0
+        ? Math.round(promoUnitPrice / baseAmt)
+        : latest.effective_unit_price || latest.unit_price;
+    const packageUnitPrice = promoUnitPrice || latest.price;
 
     latestByStore[store] = {
       ...latest,
+      product_url: normalizeProductUrl(latest.product_url, store),
       brand: brandClean,
+      promo_unit_price: promoUnitPrice,
+      promo_min_qty: promoMinQty,
+      effective_unit_price: effectiveUnitPrice,
+      package_unit_price: packageUnitPrice,
       protein_price: nut.pricePer10gProtein,
       protein_grams_total: nut.proteinGramsTotal,
       protein_per_100g: nut.proteinPer100g,
@@ -419,6 +437,16 @@ export function enrichTrackedItemWithStats(item) {
   const bestByUnitPrice = byUnit[0] || null;
   const worstByUnitPrice = byUnit.length > 1 ? byUnit[byUnit.length - 1] : null;
 
+  const byEffective = [...candidatePool].sort(
+    (a, b) => (a.effective_unit_price || a.unit_price) - (b.effective_unit_price || b.unit_price)
+  );
+  const bestByEffectiveUnitPrice = byEffective[0] || null;
+
+  const byPackage = [...candidatePool].sort(
+    (a, b) => (a.package_unit_price || a.price) - (b.package_unit_price || b.price)
+  );
+  const bestByPackagePrice = byPackage[0] || null;
+
   const withProtein = candidatePool.filter((s) => s.protein_price > 0);
   withProtein.sort((a, b) => a.protein_price - b.protein_price || a.unit_price - b.unit_price);
   const bestByProteinPrice = withProtein[0] || null;
@@ -443,18 +471,40 @@ export function enrichTrackedItemWithStats(item) {
         )
       : 0;
 
+  const normalizedHistory = snapshots.map((s) => {
+    const sSpec = extractQuantityFromText(s.product_name, s.format_label || "");
+    const sBase = sSpec?.baseAmount || 1;
+    const sBundle = s.promo_text ? parseBundle(s.promo_text) : null;
+    const sPromoUnit =
+      sBundle?.unitPriceInBundle && sBundle.unitPriceInBundle < s.price
+        ? sBundle.unitPriceInBundle
+        : null;
+    const sEffUnit =
+      sPromoUnit && sBase > 0
+        ? Math.round(sPromoUnit / sBase)
+        : s.effective_unit_price || s.unit_price;
+    return {
+      ...s,
+      product_url: normalizeProductUrl(s.product_url, s.store),
+      promo_unit_price: sPromoUnit,
+      effective_unit_price: sEffUnit,
+    };
+  });
+
   return {
     ...item,
     pinnedProducts,
     latestByStore,
     variabilityByStore,
     bestByUnitPrice,
+    bestByEffectiveUnitPrice,
+    bestByPackagePrice,
     bestByProteinPrice,
     bestByNutritionScore,
     bestByTotalPrice,
     maxSavingsPct,
     totalSnapshots: snapshots.length,
-    history: snapshots,
+    history: normalizedHistory,
   };
 }
 
