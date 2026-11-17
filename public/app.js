@@ -7,7 +7,7 @@ const STORE_META = {
 };
 
 const STORE_ORDER = ["jumbo", "santaisabel", "unimarc", "tottus", "lider"];
-const CART_TABLE_STORES = ["jumbo", "santaisabel", "unimarc", "tottus"];
+const CART_TABLE_STORES = ["jumbo", "santaisabel", "unimarc", "tottus", "lider"];
 
 let state = {
   trackedItems: [],
@@ -694,7 +694,7 @@ function renderBasketComparison() {
       strategiesGrid.innerHTML = `<div class="empty-state">Tu carrito está vacío. Agrega productos arriba para ver dónde es más barato.</div>`;
     if (summaryGrid) summaryGrid.innerHTML = "";
     if (tbody)
-      tbody.innerHTML = `<tr><td colspan="6" style="text-align:center;padding:2rem;" class="small-muted">Sin productos en este carrito aún.</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:2rem;" class="small-muted">Sin productos en este carrito aún.</td></tr>`;
     if (roadmapGrid) roadmapGrid.innerHTML = "";
     return;
   }
@@ -734,14 +734,14 @@ function renderBasketComparison() {
 
       <div class="strategy-card">
         <div class="strategy-tag" style="color:#fbbf24;">🥈 OPCIÓN 2: COMBINAR MÁXIMO 2 SUPERMERCADOS</div>
-        <div class="strategy-price">${twoCombo ? fmtClp(twoCombo.totalClp) : "—"}</div>
+        <div class="strategy-price">${twoCombo ? fmtClp(twoCombo.netTotalClp || twoCombo.totalClp) : "—"}</div>
         <div class="small-muted" style="margin-top:0.25rem;">
           ${
             twoCombo
-              ? `Comprando en <strong>${twoCombo.storeNames}</strong> (${twoCombo.foundCount} productos). ${
-                  winSingle && winSingle.totalClp > twoCombo.totalClp
-                    ? `Ahorras <strong>${fmtClp(winSingle.totalClp - twoCombo.totalClp)} extra</strong> en productos vs ir a 1 sola tienda.`
-                    : "Mismo costo de productos que ir a 1 tienda."
+              ? `Comprando en <strong>${twoCombo.storeNames}</strong> (${twoCombo.foundCount} productos${twoCombo.deliveryFeesClp > 0 ? ` · incluye ${fmtClp(twoCombo.deliveryFeesClp)} despacho` : " · Despacho Gratis"}). ${
+                  winSingle && (winSingle.netTotalClp ?? winSingle.totalClp) > (twoCombo.netTotalClp || twoCombo.totalClp)
+                    ? `Ahorras <strong>${fmtClp((winSingle.netTotalClp ?? winSingle.totalClp) - (twoCombo.netTotalClp || twoCombo.totalClp))} netos</strong> vs ir a 1 sola tienda.`
+                    : "Mismo o mayor costo neto que ir a 1 tienda."
                 }`
               : "Requiere al menos 2 tiendas con stock."
           }
@@ -854,8 +854,8 @@ function renderBasketComparison() {
               <div style="font-size:0.98rem; font-weight:800; color:${isBest ? "#34d399" : "#f8fafc"};">
                 ${fmtClp(offer.lineTotal)}
                 ${
-                  item.quantity > 1
-                    ? `<span class="small-muted" style="font-weight:400;">(${item.quantity} × ${fmtClp(offer.effectivePackagePrice)})</span>`
+                  (offer.qty || item.quantity) > 1 || offer.isScaledQty
+                    ? `<span class="small-muted" style="font-weight:400;">(${offer.qty || item.quantity} × ${fmtClp(offer.effectivePackagePrice)}${offer.isScaledQty ? " · eq." : ""})</span>`
                     : ""
                 }
               </div>
