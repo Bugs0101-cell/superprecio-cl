@@ -16,6 +16,8 @@ let state = {
   selectedHistoryItemId: null,
   chartMode: "unit", // 'unit' | 'total'
   unitScale: "base", // 'base' ($/kg, $/lt) | 'per100' ($/100g, $/100ml) | 'small' ($/g, $/ml) | 'protein' ($/10g prot)
+  cardSortByItemId: {}, // { [itemId]: 'unit' | 'protein' | 'nutrition' }
+  selectedSearchBrand: "all",
   liveSearchResults: [],
   liveSearchPackTraps: [],
   liveSearchQuery: "",
@@ -233,7 +235,17 @@ function renderTrackedCards() {
 
   grid.innerHTML = state.trackedItems
     .map((item) => {
-      const best = item.bestByUnitPrice;
+      const cardMode =
+        state.cardSortByItemId[item.id] ||
+        (state.unitScale === "protein" ? "protein" : "unit");
+
+      const best =
+        cardMode === "protein"
+          ? item.bestByProteinPrice || item.bestByUnitPrice
+          : cardMode === "nutrition"
+          ? item.bestByNutritionScore || item.bestByUnitPrice
+          : item.bestByUnitPrice;
+
       const latestMap = item.latestByStore || {};
       const varMap = item.variabilityByStore || {};
 
@@ -260,12 +272,24 @@ function renderTrackedCards() {
           ? `<span class="signal-pill signal-${snap.signal || "normal"}" title="${snap.signalExplanation || ""}">${snap.signalLabel}</span>`
           : "";
 
+        const gradeClass = snap.nutrition_grade
+          ? "grade-" + snap.nutrition_grade.toLowerCase().replace("+", "plus")
+          : "";
+
+        const nutritionTag = snap.nutrition_badge
+          ? `<span class="nutrition-badge ${gradeClass}" title="Calidad y perfil nutricional">${snap.nutrition_badge}</span>`
+          : "";
+
         const proteinTag = snap.protein_price
-          ? `<span class="protein-tag" title="Precio por cada 10g de proteína pura">🥩 ${fmtClp(snap.protein_price)}/10g prot</span>`
+          ? `<span class="protein-tag" title="Precio por cada 10g de proteína real">🥩 ${fmtClp(snap.protein_price)}/10g prot${snap.protein_grams_total ? ` (${snap.protein_grams_total}g tot.)` : ""}</span>`
+          : "";
+
+        const purityTag = snap.purity_warning
+          ? `<span class="purity-warning-pill ${snap.is_pure === false ? "is-impure" : "is-blend"}">${snap.purity_warning}</span>`
           : "";
 
         return `
-          <div class="store-row ${isWinner ? "is-cheapest" : ""}">
+          <div class="store-row ${isWinner ? "is-cheapest" : ""} ${snap.is_pure === false ? "is-impure-row" : ""}">
             <div>
               <span class="store-badge store-${storeId}">${STORE_META[storeId]?.name || storeId}</span>
             </div>
@@ -274,19 +298,29 @@ function renderTrackedCards() {
                 ${isWinner ? "🏆 " : ""}${snap.product_name}
               </a>
               <div class="store-row-meta">
+                ${snap.brand ? `<span class="brand-mini-pill">🏷️ ${snap.brand}</span>` : ""}
                 <span>📦 ${snap.format_label || `1 ${snap.unit}`}</span>
                 ${snap.promo_text ? `<span style="color:#fbbf24;">🏷️ ${snap.promo_text}</span>` : ""}
-                ${signalBadge}
+                ${purityTag}
+                ${nutritionTag}
                 ${proteinTag}
+                ${signalBadge}
                 <span>${minMaxText}</span>
               </div>
             </div>
             <div class="store-row-prices">
               <div class="unit-price-main">
-                ${fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price)}
+                ${
+                  cardMode === "protein" && snap.protein_price
+                    ? `${fmtClp(snap.protein_price)} / 10g prot`
+                    : cardMode === "nutrition" && snap.nutrition_score
+                    ? `Score ${snap.nutrition_score}/100 (${snap.nutrition_grade || ""})`
+                    : fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price)
+                }
               </div>
               <div class="total-price-sub">
                 Total: <strong>${fmtClp(snap.price)}</strong>
+                ${cardMode !== "unit" ? `· <span>${fmtClp(snap.unit_price)}/${snap.unit === "lt" ? "L" : snap.unit}</span>` : ""}
                 ${snap.list_price ? `<span class="crossed-price">${fmtClp(snap.list_price)}</span>` : ""}
                 ${deltaBadge}
               </div>
@@ -297,13 +331,29 @@ function renderTrackedCards() {
         .filter(Boolean)
         .join("");
 
+      const winnerTitle =
+        cardMode === "protein" && best?.protein_price
+          ? "🥩 Mejor $/10g Proteína:"
+          : cardMode === "nutrition" && best?.nutrition_score
+          ? "🧬 Mejor Calidad Nutricional:"
+          : "🏆 Mejor $/Unidad:";
+
+      const winnerMetric =
+        cardMode === "protein" && best?.protein_price
+          ? `${fmtClp(best.protein_price)} / 10g prot`
+          : cardMode === "nutrition" && best?.nutrition_score
+          ? `${best.nutrition_grade || ""} (${best.nutrition_score}/100)`
+          : best
+          ? fmtUnitScaled(best.unit_price, best.unit, state.unitScale, best.protein_price)
+          : "—";
+
       const winnerHtml = best
         ? `
           <div class="winner-banner">
             <div class="winner-banner-left">
-              <span>🏆 Mejor $/Unidad: <strong>${STORE_META[best.store]?.name}</strong></span>
-              <span class="winner-price-big">${fmtUnitScaled(best.unit_price, best.unit, state.unitScale, best.protein_price)}</span>
-              <span class="small-muted">(${fmtClp(best.price)} el envase de ${best.format_label || "1 " + best.unit})</span>
+              <span>${winnerTitle} <strong>${STORE_META[best.store]?.name}</strong></span>
+              <span class="winner-price-big">${winnerMetric}</span>
+              <span class="small-muted">(${fmtClp(best.price)} · ${best.format_label || "1 " + best.unit}${cardMode !== "unit" ? ` · ${fmtClp(best.unit_price)}/${best.unit === "lt" ? "L" : best.unit}` : ""})</span>
             </div>
             ${
               item.maxSavingsPct > 0
@@ -337,6 +387,11 @@ function renderTrackedCards() {
               <div class="tracked-query-sub">
                 🔍 Búsqueda auto: <code>${item.search_query || "Solo fijados"}</code>
                 ${pinnedCount > 0 ? ` · 📌 ${pinnedCount} fijado(s)` : ""}
+              </div>
+              <div class="card-mode-pills">
+                <button type="button" class="card-mode-pill ${cardMode === "unit" ? "active" : ""}" data-item-id="${item.id}" data-mode="unit">💲 $/Unidad</button>
+                <button type="button" class="card-mode-pill ${cardMode === "protein" ? "active" : ""}" data-item-id="${item.id}" data-mode="protein">🥩 $/10g Prot</button>
+                <button type="button" class="card-mode-pill ${cardMode === "nutrition" ? "active" : ""}" data-item-id="${item.id}" data-mode="nutrition">🧬 Nutrición</button>
               </div>
             </div>
             <div style="display:flex; gap:0.4rem;">
@@ -372,6 +427,14 @@ function renderTrackedCards() {
       `;
     })
     .join("");
+
+  grid.querySelectorAll(".card-mode-pill").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const itemId = Number(btn.dataset.itemId);
+      state.cardSortByItemId[itemId] = btn.dataset.mode;
+      renderTrackedCards();
+    });
+  });
 
   // Eventos de las tarjetas
   grid.querySelectorAll(".btn-add-tracked-to-cart").forEach((btn) => {
@@ -813,6 +876,70 @@ function renderBasketComparison() {
       .join("");
   }
 
+  // 2b. Resumen Nutricional y de Proteínas del Carrito
+  const nutBox = document.getElementById("cartNutritionSummaryBox");
+  if (nutBox) {
+    const storesWithNutrition = (cart.singleStoreRanking || []).filter(
+      (s) => s.totalProteinGrams > 0 || s.avgNutritionScore > 0
+    );
+    const nutSummary = cart.cartNutritionSummary || {};
+    const bestProtStore = nutSummary.bestProteinStore;
+    const topProt = nutSummary.topProteinItems || [];
+
+    if (storesWithNutrition.length > 0) {
+      nutBox.innerHTML = `
+        <div class="cart-nutrition-panel">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem; margin-bottom:0.75rem;">
+            <div>
+              <h4 style="margin:0;">🧬 Densidad Proteica y Calidad Nutricional del Carrito</h4>
+              <p class="small-muted" style="margin:0.15rem 0 0;">Compara cuánta proteína total entrega este carrito en cada cadena y su costo real por cada 10 g de proteína.</p>
+            </div>
+            ${
+              bestProtStore
+                ? `<span class="nutrition-badge grade-aplus">🥩 Mejor eficiencia proteica: ${bestProtStore.storeName} (${fmtClp(bestProtStore.avgCostPer10gProtein)}/10g prot · ${(bestProtStore.totalProteinGrams / 1000).toFixed(2)} kg prot.)</span>`
+                : ""
+            }
+          </div>
+          <div class="cart-nutrition-grid">
+            ${storesWithNutrition
+              .map(
+                (st) => `
+              <div class="cart-nutrition-store-card ${bestProtStore && bestProtStore.store === st.store ? "is-best-prot" : ""}">
+                <div style="display:flex; justify-content:space-between; align-items:center;">
+                  <span class="store-badge store-${st.store}">${st.storeName}</span>
+                  ${st.avgNutritionScore ? `<span class="nutrition-badge grade-${st.avgNutritionScore >= 85 ? "aplus" : st.avgNutritionScore >= 75 ? "a" : "b"}">Score ${st.avgNutritionScore}/100</span>` : ""}
+                </div>
+                <div style="margin-top:0.5rem; font-size:0.95rem; font-weight:800; color:#60a5fa;">
+                  ${st.totalProteinGrams.toLocaleString("es-CL")} g proteína total
+                </div>
+                <div class="small-muted">
+                  ${st.avgCostPer10gProtein ? `Costo proteico: <strong>${fmtClp(st.avgCostPer10gProtein)} / 10g</strong>` : "Sin densidad proteica calculada"}
+                </div>
+              </div>
+            `
+              )
+              .join("")}
+          </div>
+          ${
+            topProt.length > 0
+              ? `<div class="small-muted" style="margin-top:0.65rem;">
+                  <strong>Principales fuentes de proteína del carro:</strong>
+                  ${topProt
+                    .map(
+                      (tp) =>
+                        `<span class="brand-mini-pill">${tp.label}: <strong>${tp.totalProteinGrams}g</strong> (${tp.bestProteinStore} · ${fmtClp(tp.bestPricePer10g)}/10g)</span>`
+                    )
+                    .join(" ")}
+                </div>`
+              : ""
+          }
+        </div>
+      `;
+    } else {
+      nutBox.innerHTML = "";
+    }
+  }
+
   // 3. Renderizar Tabla Interactiva de Ítems del Carrito
   if (tbody) {
     tbody.innerHTML = cart.items
@@ -862,11 +989,31 @@ function renderBasketComparison() {
               <div style="font-size:0.78rem; font-weight:600; color:#94a3b8;">
                 ${fmtUnitScaled(p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)} · 📦 ${p.formatLabel}
               </div>
+              ${
+                p.brand
+                  ? `<div style="font-size:0.72rem; color:#93c5fd; font-weight:600;">🏷️ ${p.brand}</div>`
+                  : ""
+              }
               <div style="margin-top:0.2rem;">
                 <a href="${p.url || "#"}" target="_blank" rel="noopener" style="color:#cbd5e1; font-size:0.76rem; text-decoration:none;">
                   ${p.name.slice(0, 42)}
                 </a>
               </div>
+              ${
+                p.pricePer10gProtein
+                  ? `<div class="nutrition-badge-mini">🥩 ${fmtClp(p.pricePer10gProtein)}/10g prot (${p.proteinGramsTotal}g)</div>`
+                  : ""
+              }
+              ${
+                p.nutritionBadge
+                  ? `<div class="nutrition-badge-mini" style="color:#a7f3d0;">${p.nutritionBadge}</div>`
+                  : ""
+              }
+              ${
+                p.purityWarning
+                  ? `<div class="purity-warning-pill ${p.isPure === false ? "is-impure" : "is-blend"}" style="margin-top:0.2rem;">${p.purityWarning}</div>`
+                  : ""
+              }
               ${
                 offer.appliedPromo
                   ? `<div style="font-size:0.7rem; color:#fbbf24; font-weight:700;">🏷️ Promo aplicada: ${offer.promoText}</div>`
@@ -1021,6 +1168,7 @@ async function executeLiveSearch(query) {
   if (!q) return;
 
   state.liveSearchQuery = q;
+  state.selectedSearchBrand = "all";
   const container = document.getElementById("searchResultsContainer");
   const statusBar = document.getElementById("searchStoreStatusBar");
   const btnSearch = document.getElementById("btnRunSearch");
@@ -1069,12 +1217,129 @@ async function executeLiveSearch(query) {
   }
 }
 
+function renderSearchProductCard(p, idx, bestUnitPrice) {
+  const isBest = p.unitPrice === bestUnitPrice;
+  const discountPct =
+    p.listPrice && p.listPrice > p.price
+      ? Math.round(((p.listPrice - p.price) / p.listPrice) * 100)
+      : 0;
+
+  const uLabel = p.unit === "kg" ? "kg" : p.unit === "lt" ? "L" : "un";
+  const smallLabel = p.unit === "kg" ? "g" : p.unit === "lt" ? "ml" : "un";
+  const per100Label = p.unit === "kg" ? "100g" : p.unit === "lt" ? "100ml" : "un";
+
+  const gradeClass = p.nutritionGrade
+    ? "grade-" + p.nutritionGrade.toLowerCase().replace("+", "plus")
+    : "";
+
+  const nutritionBadgeHtml = p.nutritionBadge
+    ? `<div class="nutrition-badge ${gradeClass}" style="margin-top:0.35rem;">${p.nutritionBadge}</div>`
+    : "";
+
+  const purityHtml = p.purityWarning
+    ? `<div class="purity-warning-pill ${p.isPure === false ? "is-impure" : "is-blend"}" style="margin-top:0.3rem;">${p.purityWarning}</div>`
+    : "";
+
+  const proteinHtml = p.hasProteinData
+    ? `
+      <div class="protein-tag" title="Estimación nutricional basada en perfil nutricional real del producto">
+        🥩 <strong>${fmtClp(p.pricePer10gProtein)}</strong> / 10g proteína
+        <span style="font-weight:400; opacity:0.85;">(${p.proteinGramsTotal}g totales · ${p.proteinPer100g}g/100g)</span>
+      </div>
+    `
+    : "";
+
+  return `
+    <div class="product-card ${isBest ? "best-unit-deal" : ""} ${p.isPure === false ? "is-impure-card" : ""}">
+      <div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
+          <span class="store-badge store-${p.store}">${p.storeName}</span>
+          ${isBest ? `<span class="best-deal-ribbon">🏆 MEJOR $/UNIDAD</span>` : ""}
+          ${!isBest && discountPct > 0 ? `<span class="savings-badge">-${discountPct}%</span>` : ""}
+        </div>
+
+        <div class="product-card-head">
+          ${
+            p.imageUrl
+              ? `<img src="${p.imageUrl}" alt="${p.name}" class="product-thumb" loading="lazy" />`
+              : `<div class="product-thumb" style="display:flex;align-items:center;justify-content:center;color:#000;">🛒</div>`
+          }
+          <div>
+            <a href="${p.url || "#"}" target="_blank" rel="noopener" class="product-title" title="${p.name}">
+              ${p.name}
+            </a>
+            <div class="product-brand-format">
+              ${p.brand ? `<strong style="color:#93c5fd;">${p.brand}</strong> · ` : ""}📦 Formato: <strong>${p.formatLabel}</strong>
+            </div>
+          </div>
+        </div>
+        ${purityHtml}
+        ${nutritionBadgeHtml}
+      </div>
+
+      <div>
+        <div class="unit-price-box">
+          <div style="display:flex; justify-content:space-between; align-items:baseline;">
+            <span class="small-muted">Precio por ${uLabel}:</span>
+            <span class="unit-price-big">${fmtUnitScaled(p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)}</span>
+          </div>
+          ${
+            p.unit === "kg" || p.unit === "lt"
+              ? `
+              <div class="unit-Breakdown-row">
+                <span>Por ${per100Label}: <strong>${fmtClp(p.pricePer100)}</strong></span>
+                <span>Por 1 ${smallLabel}: <strong>$${p.pricePerSmallUnit}</strong></span>
+              </div>
+            `
+              : ""
+          }
+          ${
+            p.effectiveUnitPrice && p.effectiveUnitPrice < p.unitPrice
+              ? `<div class="unit-Breakdown-row" style="color:#fbbf24; font-weight:700;">
+                  <span>🏷️ Con Promo (${p.promoText}):</span>
+                  <span>${fmtClp(p.effectiveUnitPrice)} / ${uLabel}</span>
+                </div>`
+              : ""
+          }
+          ${proteinHtml}
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.65rem; gap:0.4rem;">
+          <div>
+            <div class="small-muted">Precio envase:</div>
+            <div style="font-size:1.05rem; font-weight:800;">
+              ${fmtClp(p.price)}
+              ${p.listPrice ? `<span class="crossed-price" style="font-size:0.8rem;">${fmtClp(p.listPrice)}</span>` : ""}
+            </div>
+          </div>
+
+          <div style="display:flex; gap:0.35rem;">
+            <button class="btn btn-accent btn-sm btn-add-search-to-cart" data-idx="${idx}" title="Agregar al carrito activo">
+              🛒 + Carrito
+            </button>
+            <button class="btn btn-secondary btn-sm btn-pin-result" data-idx="${idx}" title="Fijar en seguimiento histórico">
+              📌 Fijar
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 function renderLiveSearchResults() {
   const container = document.getElementById("searchResultsContainer");
   const sortMode = document.getElementById("searchSortSelect").value;
   const unitFilter = document.getElementById("searchUnitFilter").value;
   const storeFilter = document.getElementById("searchStoreFilter").value;
+  const brandSelect = document.getElementById("searchBrandFilter");
+  const viewModeSelect = document.getElementById("searchViewModeSelect");
+  const pureOnlyChk = document.getElementById("searchPureOnlyCheckbox");
+  const brandChipsBar = document.getElementById("searchBrandChipsBar");
   const trapsBanner = document.getElementById("searchPackTrapsBanner");
+
+  const viewMode = viewModeSelect ? viewModeSelect.value : "by_brand";
+  const pureOnly = pureOnlyChk ? pureOnlyChk.checked : true;
 
   // Mostrar u ocultar alerta de Falsos Packs Ahorro
   if (trapsBanner) {
@@ -1101,17 +1366,98 @@ function renderLiveSearchResults() {
     }
   }
 
-  let filtered = [...state.liveSearchResults];
-
+  let basePool = [...state.liveSearchResults];
   if (unitFilter !== "all") {
-    filtered = filtered.filter((p) => p.unit === unitFilter);
+    basePool = basePool.filter((p) => p.unit === unitFilter);
   }
   if (storeFilter !== "all") {
-    filtered = filtered.filter((p) => p.store === storeFilter);
+    basePool = basePool.filter((p) => p.store === storeFilter);
+  }
+  if (pureOnly) {
+    const pureItems = basePool.filter((p) => p.isPure !== false);
+    if (pureItems.length > 0) {
+      basePool = pureItems;
+    }
+  }
+
+  // Agrupar marcas disponibles para el selector y los chips de marca
+  const brandStatsMap = {};
+  for (const p of basePool) {
+    const bName = p.brand || "Genérico / Marca Propia";
+    if (!brandStatsMap[bName]) {
+      brandStatsMap[bName] = {
+        brand: bName,
+        count: 0,
+        minUnitPrice: Infinity,
+        minProteinPrice: Infinity,
+        maxNutritionScore: 0,
+        sampleUnit: p.unit,
+      };
+    }
+    brandStatsMap[bName].count++;
+    if (p.unitPrice && p.unitPrice < brandStatsMap[bName].minUnitPrice) {
+      brandStatsMap[bName].minUnitPrice = p.unitPrice;
+      brandStatsMap[bName].sampleUnit = p.unit;
+    }
+    if (p.pricePer10gProtein && p.pricePer10gProtein < brandStatsMap[bName].minProteinPrice) {
+      brandStatsMap[bName].minProteinPrice = p.pricePer10gProtein;
+    }
+    if ((p.nutritionScore || 0) > brandStatsMap[bName].maxNutritionScore) {
+      brandStatsMap[bName].maxNutritionScore = p.nutritionScore;
+    }
+  }
+
+  const brandList = Object.values(brandStatsMap).sort(
+    (a, b) => a.minUnitPrice - b.minUnitPrice || b.count - a.count
+  );
+
+  if (state.selectedSearchBrand !== "all" && !brandStatsMap[state.selectedSearchBrand]) {
+    state.selectedSearchBrand = "all";
+  }
+
+  if (brandSelect) {
+    brandSelect.innerHTML = [
+      `<option value="all">Todas las marcas (${brandList.length})</option>`,
+      ...brandList.map(
+        (b) =>
+          `<option value="${b.brand}" ${state.selectedSearchBrand === b.brand ? "selected" : ""}>${b.brand} (${b.count})</option>`
+      ),
+    ].join("");
+  }
+
+  if (brandChipsBar) {
+    if (brandList.length > 0) {
+      brandChipsBar.style.display = "flex";
+      brandChipsBar.innerHTML = [
+        `<button type="button" class="brand-chip-btn ${state.selectedSearchBrand === "all" ? "active" : ""}" data-brand="all">🏢 Todas las Marcas (${basePool.length})</button>`,
+        ...brandList.map((b) => {
+          const uLbl = b.sampleUnit === "lt" ? "L" : b.sampleUnit === "kg" ? "kg" : "un";
+          return `<button type="button" class="brand-chip-btn ${state.selectedSearchBrand === b.brand ? "active" : ""}" data-brand="${b.brand}">${b.brand} (${b.count}) · desde ${fmtClp(b.minUnitPrice)}/${uLbl}</button>`;
+        }),
+      ].join("");
+
+      brandChipsBar.querySelectorAll(".brand-chip-btn").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          state.selectedSearchBrand = btn.dataset.brand;
+          if (brandSelect) brandSelect.value = state.selectedSearchBrand;
+          renderLiveSearchResults();
+        });
+      });
+    } else {
+      brandChipsBar.style.display = "none";
+    }
+  }
+
+  let filtered = [...basePool];
+  if (state.selectedSearchBrand !== "all") {
+    filtered = filtered.filter(
+      (p) => (p.brand || "Genérico / Marca Propia") === state.selectedSearchBrand
+    );
   }
 
   if (filtered.length === 0) {
     if (container) {
+      container.className = "search-results-grid";
       container.innerHTML = `<div class="empty-state">No hay productos que coincidan con los filtros seleccionados.</div>`;
     }
     return;
@@ -1121,6 +1467,9 @@ function renderLiveSearchResults() {
     if (sortMode === "unit_asc") return a.unitPrice - b.unitPrice;
     if (sortMode === "protein_asc") {
       return (a.pricePer10gProtein || 9999999) - (b.pricePer10gProtein || 9999999);
+    }
+    if (sortMode === "nutrition_desc") {
+      return (b.nutritionScore || 0) - (a.nutritionScore || 0) || a.unitPrice - b.unitPrice;
     }
     if (sortMode === "effective_unit_asc")
       return (a.effectiveUnitPrice ?? a.unitPrice) - (b.effectiveUnitPrice ?? b.unitPrice);
@@ -1136,103 +1485,68 @@ function renderLiveSearchResults() {
   const bestUnitPrice = Math.min(...filtered.map((p) => p.unitPrice));
 
   if (container) {
-    container.innerHTML = filtered
-      .map((p, idx) => {
-        const isBest = p.unitPrice === bestUnitPrice;
-        const discountPct =
-          p.listPrice && p.listPrice > p.price
-            ? Math.round(((p.listPrice - p.price) / p.listPrice) * 100)
-            : 0;
+    if (viewMode === "by_brand") {
+      container.className = "brand-groups-wrap";
+      const groupsMap = {};
+      filtered.forEach((p, idx) => {
+        const bName = p.brand || "Genérico / Marca Propia";
+        if (!groupsMap[bName]) groupsMap[bName] = [];
+        groupsMap[bName].push({ p, idx });
+      });
 
-        const uLabel = p.unit === "kg" ? "kg" : p.unit === "lt" ? "L" : "un";
-        const smallLabel = p.unit === "kg" ? "g" : p.unit === "lt" ? "ml" : "un";
-        const per100Label = p.unit === "kg" ? "100g" : p.unit === "lt" ? "100ml" : "un";
+      const sortedGroups = Object.entries(groupsMap).sort((a, b) => {
+        if (sortMode === "protein_asc") {
+          const minA = Math.min(...a[1].map((x) => x.p.pricePer10gProtein || 9999999));
+          const minB = Math.min(...b[1].map((x) => x.p.pricePer10gProtein || 9999999));
+          return minA - minB;
+        }
+        if (sortMode === "nutrition_desc") {
+          const maxA = Math.max(...a[1].map((x) => x.p.nutritionScore || 0));
+          const maxB = Math.max(...b[1].map((x) => x.p.nutritionScore || 0));
+          return maxB - maxA;
+        }
+        const unitA = Math.min(...a[1].map((x) => x.p.unitPrice));
+        const unitB = Math.min(...b[1].map((x) => x.p.unitPrice));
+        return unitA - unitB;
+      });
 
-        const proteinHtml = p.hasProteinData
-          ? `
-            <div class="protein-tag" title="Estimación nutricional basada en contenido proteico estándar">
-              🥩 <strong>${fmtClp(p.pricePer10gProtein)}</strong> / 10g proteína
-              <span style="font-weight:400; opacity:0.85;">(${p.proteinGramsTotal}g totales en envase · ${p.proteinPer100g}g/100g)</span>
-            </div>
-          `
-          : "";
+      container.innerHTML = sortedGroups
+        .map(([bName, entries]) => {
+          const firstP = entries[0].p;
+          const uLbl = firstP.unit === "kg" ? "kg" : firstP.unit === "lt" ? "L" : "un";
+          const minUnit = Math.min(...entries.map((x) => x.p.unitPrice));
+          const protPrices = entries
+            .map((x) => x.p.pricePer10gProtein)
+            .filter((v) => v && v > 0);
+          const minProt = protPrices.length > 0 ? Math.min(...protPrices) : null;
+          const maxScore = Math.max(...entries.map((x) => x.p.nutritionScore || 0));
 
-        return `
-          <div class="product-card ${isBest ? "best-unit-deal" : ""}">
-            <div>
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-                <span class="store-badge store-${p.store}">${p.storeName}</span>
-                ${isBest ? `<span class="best-deal-ribbon">🏆 MEJOR $/UNIDAD</span>` : ""}
-                ${!isBest && discountPct > 0 ? `<span class="savings-badge">-${discountPct}%</span>` : ""}
-              </div>
-
-              <div class="product-card-head">
-                ${
-                  p.imageUrl
-                    ? `<img src="${p.imageUrl}" alt="${p.name}" class="product-thumb" loading="lazy" />`
-                    : `<div class="product-thumb" style="display:flex;align-items:center;justify-content:center;color:#000;">🛒</div>`
-                }
-                <div>
-                  <a href="${p.url || "#"}" target="_blank" rel="noopener" class="product-title" title="${p.name}">
-                    ${p.name}
-                  </a>
-                  <div class="product-brand-format">
-                    ${p.brand ? `<strong>${p.brand}</strong> · ` : ""}📦 Formato: <strong>${p.formatLabel}</strong>
-                  </div>
+          return `
+            <section class="brand-group-section">
+              <div class="brand-group-header">
+                <div style="display:flex; align-items:center; gap:0.65rem; flex-wrap:wrap;">
+                  <span class="brand-group-title">🏢 ${bName}</span>
+                  <span class="small-muted">${entries.length} ${entries.length === 1 ? "formato" : "formatos / tiendas"}</span>
+                </div>
+                <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                  <span class="savings-badge">Mejor $/u: ${fmtClp(minUnit)}/${uLbl}</span>
+                  ${minProt ? `<span class="protein-tag" style="margin:0;">🥩 Desde ${fmtClp(minProt)}/10g prot</span>` : ""}
+                  ${maxScore > 0 ? `<span class="nutrition-badge ${maxScore >= 90 ? "grade-aplus" : maxScore >= 80 ? "grade-a" : "grade-b"}">Score máx ${maxScore}/100</span>` : ""}
                 </div>
               </div>
-            </div>
-
-            <div>
-              <div class="unit-price-box">
-                <div style="display:flex; justify-content:space-between; align-items:baseline;">
-                  <span class="small-muted">Precio por ${uLabel}:</span>
-                  <span class="unit-price-big">${fmtUnitScaled(p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)}</span>
-                </div>
-                ${
-                  p.unit === "kg" || p.unit === "lt"
-                    ? `
-                    <div class="unit-Breakdown-row">
-                      <span>Por ${per100Label}: <strong>${fmtClp(p.pricePer100)}</strong></span>
-                      <span>Por 1 ${smallLabel}: <strong>$${p.pricePerSmallUnit}</strong></span>
-                    </div>
-                  `
-                    : ""
-                }
-                ${
-                  p.effectiveUnitPrice && p.effectiveUnitPrice < p.unitPrice
-                    ? `<div class="unit-Breakdown-row" style="color:#fbbf24; font-weight:700;">
-                        <span>🏷️ Con Promo (${p.promoText}):</span>
-                        <span>${fmtClp(p.effectiveUnitPrice)} / ${uLabel}</span>
-                      </div>`
-                    : ""
-                }
-                ${proteinHtml}
+              <div class="search-results-grid">
+                ${entries.map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice)).join("")}
               </div>
-
-              <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.65rem; gap:0.4rem;">
-                <div>
-                  <div class="small-muted">Precio envase:</div>
-                  <div style="font-size:1.05rem; font-weight:800;">
-                    ${fmtClp(p.price)}
-                    ${p.listPrice ? `<span class="crossed-price" style="font-size:0.8rem;">${fmtClp(p.listPrice)}</span>` : ""}
-                  </div>
-                </div>
-
-                <div style="display:flex; gap:0.35rem;">
-                  <button class="btn btn-accent btn-sm btn-add-search-to-cart" data-idx="${idx}" title="Agregar al carrito activo">
-                    🛒 + Carrito
-                  </button>
-                  <button class="btn btn-secondary btn-sm btn-pin-result" data-idx="${idx}" title="Fijar en seguimiento histórico">
-                    📌 Fijar
-                  </button>
-                </div>
-              </div>
-            </div>
-          </div>
-        `;
-      })
-      .join("");
+            </section>
+          `;
+        })
+        .join("");
+    } else {
+      container.className = "search-results-grid";
+      container.innerHTML = filtered
+        .map((p, idx) => renderSearchProductCard(p, idx, bestUnitPrice))
+        .join("");
+    }
 
     container.querySelectorAll(".btn-add-search-to-cart").forEach((btn) => {
       btn.addEventListener("click", async () => {
@@ -1931,10 +2245,15 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  ["searchSortSelect", "searchUnitFilter", "searchStoreFilter"].forEach((id) => {
+  ["searchSortSelect", "searchUnitFilter", "searchStoreFilter", "searchViewModeSelect", "searchPureOnlyCheckbox"].forEach((id) => {
     document.getElementById(id)?.addEventListener("change", () => {
       if (state.liveSearchResults.length > 0) renderLiveSearchResults();
     });
+  });
+
+  document.getElementById("searchBrandFilter")?.addEventListener("change", (e) => {
+    state.selectedSearchBrand = e.target.value;
+    if (state.liveSearchResults.length > 0) renderLiveSearchResults();
   });
 
   // Botón Seguir esta búsqueda automáticamente

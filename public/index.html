@@ -213,6 +213,8 @@
             <select id="cartCriteriaSelect">
               <option value="unit_price">🏆 Mejor $/Unidad (kg, L)</option>
               <option value="total_price">💰 Envase Más Barato ($)</option>
+              <option value="protein_price">🥩 Mejor $/10g Proteína</option>
+              <option value="nutrition_score">🧬 Mejor Calidad Nutricional</option>
             </select>
           </div>
           <button type="button" id="btnRefreshCart" class="btn btn-primary btn-sm">
@@ -352,6 +354,7 @@
         <!-- Ranking de todos los supermercados (Todo en 1 lugar) -->
         <h4 style="margin: 1.35rem 0 0.75rem;">📊 Ranking Comprando Todo en un Solo Supermercado</h4>
         <div id="basketSummaryCards" class="basket-stores-grid"></div>
+        <div id="cartNutritionSummaryBox" style="margin-top: 1.25rem;"></div>
       </div>
 
       <!-- Tabla Interactiva de Productos del Carrito -->
@@ -428,6 +431,7 @@
             <select id="searchSortSelect">
               <option value="unit_asc">🏆 Mejor Precio por Unidad ($/kg, $/L)</option>
               <option value="protein_asc">🥩 Mejor Precio por Proteína ($/10g)</option>
+              <option value="nutrition_desc">🧬 Mayor Calidad / Score Nutricional</option>
               <option value="effective_unit_asc">🏷️ Mejor $/Unidad (con promos 2x / packs)</option>
               <option value="price_asc">💰 Menor Precio Total ($)</option>
               <option value="discount_desc">🔥 Mayor % de Descuento</option>
@@ -456,6 +460,28 @@
               <option value="lider">Lider</option>
             </select>
           </div>
+
+          <div class="filter-group">
+            <label>Marca:</label>
+            <select id="searchBrandFilter">
+              <option value="all">Todas las marcas</option>
+            </select>
+          </div>
+
+          <div class="filter-group">
+            <label>Vista:</label>
+            <select id="searchViewModeSelect">
+              <option value="by_brand">🏢 Separar por Marca</option>
+              <option value="list">📋 Lista Ranking General</option>
+            </select>
+          </div>
+
+          <div class="filter-group" style="display:flex; align-items:flex-end; padding-bottom:0.35rem;">
+            <label class="checkbox-chip" title="Oculta productos de otra variedad (ej. oculta Aceite de Maravilla si buscas Canola, o Leche normal si buscas Protein)">
+              <input type="checkbox" id="searchPureOnlyCheckbox" checked />
+              <span>🛡️ Solo equivalentes puros</span>
+            </label>
+          </div>
         </div>
       </div>
 
@@ -463,6 +489,8 @@
       <div id="searchPackTrapsBanner" style="display:none; margin: 1rem 0;"></div>
 
       <div id="searchStoreStatusBar" class="store-status-bar"></div>
+
+      <div id="searchBrandChipsBar" class="brand-chips-bar" style="display:none;"></div>
 
       <div id="searchResultsContainer" class="search-results-grid">
         <div class="empty-state">
