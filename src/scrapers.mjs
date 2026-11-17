@@ -451,83 +451,73 @@ function mapTottusItem(p) {
 // --- 4. Adaptador Lider (Parser de __NEXT_DATA__ + detección de bloqueo Antibot) ---
 
 const NEXT_DATA_REGEX = /<script[^>]*\bid="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/i;
+const LD_JSON_REGEX = /<script[^>]*\btype=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
 
-function findLiderProductsInTree(node, depth = 0) {
-  if (depth > 14 || !node || typeof node !== "object") return null;
+function extractLiderPrice(val) {
+  if (val === null || val === undefined) return undefined;
+  if (typeof val === "number") return toClp(val);
+  if (typeof val === "string") return parseClpString(val);
+  if (typeof val === "object") {
+    return (
+      toClp(val.price) ??
+      parseClpString(val.priceString) ??
+      parseClpString(val.priceDisplay) ??
+      parseClpString(val.string) ??
+      parseClpString(val.value)
+    );
+  }
+  return undefined;
+}
+
+function collectLiderProductsInTree(node, out = [], seen = new Set(), depth = 0) {
+  if (depth > 25 || !node || typeof node !== "object") return out;
   if (Array.isArray(node)) {
-    if (
-      node.length > 0 &&
-      node[0] &&
-      typeof node[0] === "object" &&
-      (node[0].__typename === "Product" || node[0].usItemId || node[0].priceInfo)
-    ) {
-      return node;
-    }
     for (const child of node) {
-      const found = findLiderProductsInTree(child, depth + 1);
-      if (found) return found;
+      collectLiderProductsInTree(child, out, seen, depth + 1);
     }
-    return null;
+    return out;
   }
+
+  const rawId = node.usItemId ?? node.id ?? node.code;
+  if (rawId && node.name && (node.priceInfo || node.price || node.offers)) {
+    const key = String(rawId);
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(node);
+    }
+  }
+
   for (const key of Object.keys(node)) {
-    const found = findLiderProductsInTree(node[key], depth + 1);
-    if (found) return found;
+    collectLiderProductsInTree(node[key], out, seen, depth + 1);
   }
-  return null;
+  return out;
 }
 
-export function parseLiderRawInput(rawText) {
-  if (!rawText || typeof rawText !== "string") return [];
-  let jsonStr = rawText.trim();
-  const match = NEXT_DATA_REGEX.exec(jsonStr);
-  if (match) {
-    jsonStr = match[1];
-  }
-  let data;
-  try {
-    data = JSON.parse(jsonStr);
-  } catch {
-    return [];
-  }
-  const arr = findLiderProductsInTree(data, 0) ?? [];
-  return arr.map(mapLiderItem).filter(Boolean);
-}
-
-function mapLiderItem(p) {
-  const id = p?.usItemId ?? p?.id;
-  if (!id || !p?.name || !p?.priceInfo) return null;
-
-  const info = p.priceInfo;
-  const price = parseClpString(info.linePrice) ?? parseClpString(info.itemPrice);
-  if (!price) return null;
-
-  let listPrice = parseClpString(info.wasPrice);
-  if (listPrice !== undefined && listPrice <= price) listPrice = undefined;
-
-  const memberPrice = parseClpString(info.memberPriceString) ?? null;
-  const ppu = parseUnitPriceString(info.unitPrice);
-
+function buildNormalizedLiderProduct({
+  id,
+  name,
+  brand = "",
+  price,
+  listPrice = null,
+  memberPrice = null,
+  ppu = null,
+  description = "",
+  promoText = null,
+  bundlePricePerItem = null,
+  imageUrl = "",
+  url = "https://www.lider.cl",
+  inStock = true,
+}) {
   const unitMetrics = enrichUnitMetrics({
     price,
     storeUnitPrice: ppu?.unitPrice,
     storeUnit: ppu?.unit,
-    name: p.name,
-    description: p.shortDescription || "",
+    name,
+    description,
   });
 
-  let bundlePromo = null;
-  for (const f of p.badges?.flags ?? []) {
-    if (f?.text && f.type !== "ICON") {
-      const parsed = parseBundle(f.text);
-      if (parsed && parsed.type === "bundle") {
-        bundlePromo = parsed;
-        break;
-      }
-    }
-  }
-
   const protein = estimateProteinMetrics(
-    p.name,
+    name,
     unitMetrics.unit,
     unitMetrics.baseAmount,
     price
@@ -538,13 +528,13 @@ function mapLiderItem(p) {
     storeName: "Lider",
     externalId: String(id),
     sku: String(id),
-    name: String(p.name).trim(),
-    brand: p.brand ? String(p.brand).trim() : "",
+    name: String(name).trim(),
+    brand: brand ? String(brand).trim() : "",
     price,
     listPrice: listPrice ?? null,
-    memberPrice,
-    promoText: bundlePromo?.description || (listPrice ? "Rollback / Oferta" : null),
-    bundlePricePerItem: bundlePromo?.unitPriceInBundle ?? null,
+    memberPrice: memberPrice ?? null,
+    promoText: promoText || (listPrice ? "Rollback / Oferta" : null),
+    bundlePricePerItem,
     unit: unitMetrics.unit,
     unitPrice: unitMetrics.unitPrice,
     effectiveUnitPrice: unitMetrics.unitPrice,
@@ -558,14 +548,182 @@ function mapLiderItem(p) {
     proteinGramsTotal: protein.proteinGramsTotal,
     proteinPer100g: protein.proteinPer100g,
     pricePer10gProtein: protein.pricePer10gProtein,
-    imageUrl:
-      p.imageInfo?.thumbnailUrl || p.imageInfo?.allImages?.[0]?.url || "",
-    url: p.canonicalUrl
-      ? `https://super.lider.cl${p.canonicalUrl}`
-      : "https://super.lider.cl",
-    inStock: p.availabilityStatus ? p.availabilityStatus === "IN_STOCK" : true,
+    imageUrl: imageUrl || "",
+    url,
+    inStock,
     fetchedAt: new Date().toISOString(),
   };
+}
+
+function collectLdJsonProducts(node, out = [], pageUrl = "") {
+  if (!node || typeof node !== "object") return out;
+  if (Array.isArray(node)) {
+    for (const child of node) collectLdJsonProducts(child, out, pageUrl);
+    return out;
+  }
+  const typeVal = node["@type"];
+  const isProduct =
+    typeVal === "Product" ||
+    (Array.isArray(typeVal) && typeVal.includes("Product"));
+  if (isProduct && node.name && node.offers) {
+    const offersObj = Array.isArray(node.offers) ? node.offers[0] : node.offers;
+    const price = extractLiderPrice(offersObj?.price ?? offersObj?.lowPrice);
+    if (price) {
+      const id = node.sku || node.productID || node.gtin13 || `ld-${Date.now()}`;
+      const brand = typeof node.brand === "object" ? node.brand?.name : node.brand;
+      const imageUrl = Array.isArray(node.image) ? node.image[0] : node.image;
+      out.push(
+        buildNormalizedLiderProduct({
+          id,
+          name: node.name,
+          brand: brand || "",
+          price,
+          description: node.description || "",
+          imageUrl: typeof imageUrl === "string" ? imageUrl : "",
+          url: node.url || pageUrl || "https://www.lider.cl",
+        })
+      );
+    }
+  }
+  if (node["@graph"]) {
+    collectLdJsonProducts(node["@graph"], out, pageUrl);
+  }
+  return out;
+}
+
+export function parseLiderRawInput(rawText, pageUrl = "") {
+  if (!rawText || typeof rawText !== "string") return [];
+  let jsonStr = rawText.trim();
+  const match = NEXT_DATA_REGEX.exec(jsonStr);
+  if (match) {
+    jsonStr = match[1];
+  }
+
+  let mapped = [];
+  try {
+    const data = JSON.parse(jsonStr);
+    const arr = collectLiderProductsInTree(data);
+    mapped = arr.map((p) => mapLiderItem(p, pageUrl)).filter(Boolean);
+  } catch {
+    mapped = [];
+  }
+
+  // Fallback 1: JSON-LD (<script type="application/ld+json">) cuando SPA no actualizó __NEXT_DATA__
+  if (mapped.length === 0) {
+    const ldMatches = rawText.matchAll(LD_JSON_REGEX);
+    for (const m of ldMatches) {
+      try {
+        const parsedLd = JSON.parse(m[1]);
+        collectLdJsonProducts(parsedLd, mapped, pageUrl);
+      } catch {}
+    }
+  }
+
+  // Fallback 2: URL de ficha /ip/<slug>/<id> + HTML visible con <h1> y precio CLP
+  const ipMatch = String(pageUrl || "").match(/\/ip\/(?:([^/?#]+)\/)?(\d{6,20})/i);
+  if (mapped.length === 0 && ipMatch) {
+    const slugName = ipMatch[1] ? decodeURIComponent(ipMatch[1]).replace(/-/g, " ") : "Producto Lider";
+    const id = ipMatch[2];
+    const h1Match = rawText.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+    const titleFromHtml = h1Match ? h1Match[1].replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim() : "";
+    const sliceFromTitle = h1Match ? rawText.slice(h1Match.index) : rawText;
+    const priceMatch =
+      sliceFromTitle.match(/\$\s*([\d.]{3,7})/) || rawText.match(/\$\s*([\d.]{3,7})/);
+    const price = priceMatch ? parseClpString(priceMatch[1]) : undefined;
+    if (price) {
+      mapped.push(
+        buildNormalizedLiderProduct({
+          id,
+          name: titleFromHtml || slugName,
+          price,
+          url: pageUrl,
+        })
+      );
+    }
+  }
+
+  // Si estamos en una URL /ip/.../<id>, priorizar el producto exacto de esa URL al inicio
+  if (ipMatch && mapped.length > 1) {
+    const urlItemId = ipMatch[2];
+    const normUrlId = urlItemId.replace(/^0+/, "");
+    const exactIdx = mapped.findIndex((p) => {
+      const ext = String(p.externalId || "").replace(/^0+/, "");
+      const sku = String(p.sku || "").replace(/^0+/, "");
+      return (
+        p.externalId === urlItemId ||
+        p.sku === urlItemId ||
+        (normUrlId && (ext === normUrlId || sku === normUrlId))
+      );
+    });
+    if (exactIdx > 0) {
+      const [exact] = mapped.splice(exactIdx, 1);
+      mapped.unshift(exact);
+    }
+  }
+
+  return mapped;
+}
+
+function mapLiderItem(p, pageUrl = "") {
+  const id = p?.usItemId ?? p?.id ?? p?.code;
+  if (!id || !p?.name) return null;
+
+  const info = p.priceInfo || {};
+  const price =
+    extractLiderPrice(info.currentPrice) ??
+    extractLiderPrice(info.linePrice) ??
+    extractLiderPrice(info.itemPrice) ??
+    extractLiderPrice(info.price) ??
+    extractLiderPrice(p.price) ??
+    extractLiderPrice(p.offers);
+  if (!price) return null;
+
+  let listPrice =
+    extractLiderPrice(info.wasPrice) ?? extractLiderPrice(info.comparisonPrice);
+  if (listPrice !== undefined && listPrice <= price) listPrice = undefined;
+
+  const memberPrice =
+    extractLiderPrice(info.memberPrice) ?? parseClpString(info.memberPriceString) ?? null;
+
+  const unitPriceRaw =
+    typeof info.unitPrice === "string"
+      ? info.unitPrice
+      : info.unitPrice?.priceString || info.unitPrice?.string || "";
+  const ppu = parseUnitPriceString(unitPriceRaw);
+
+  let bundlePromo = null;
+  for (const f of p.badges?.flags ?? []) {
+    if (f?.text && f.type !== "ICON") {
+      const parsed = parseBundle(f.text);
+      if (parsed && parsed.type === "bundle") {
+        bundlePromo = parsed;
+        break;
+      }
+    }
+  }
+
+  let url = pageUrl || "https://www.lider.cl";
+  if (p.canonicalUrl) {
+    url = String(p.canonicalUrl).startsWith("http")
+      ? p.canonicalUrl
+      : `https://www.lider.cl${String(p.canonicalUrl).startsWith("/") ? "" : "/"}${p.canonicalUrl}`;
+  }
+
+  return buildNormalizedLiderProduct({
+    id,
+    name: p.name,
+    brand: p.brand || "",
+    price,
+    listPrice,
+    memberPrice,
+    ppu,
+    description: p.shortDescription || "",
+    promoText: bundlePromo?.description || (listPrice ? "Rollback / Oferta" : null),
+    bundlePricePerItem: bundlePromo?.unitPriceInBundle ?? null,
+    imageUrl: p.imageInfo?.thumbnailUrl || p.imageInfo?.allImages?.[0]?.url || "",
+    url,
+    inStock: p.availabilityStatus ? p.availabilityStatus === "IN_STOCK" : true,
+  });
 }
 
 export async function searchLider(query, limit = 18) {

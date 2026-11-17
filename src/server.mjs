@@ -257,7 +257,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const body = await readJsonBody(req);
-      const products = parseLiderRawInput(body.rawContent || "");
+      const products = parseLiderRawInput(body.rawContent || "", body.url || "");
       if (products.length === 0) {
         return sendJson(res, 400, {
           error:
@@ -279,7 +279,9 @@ const server = http.createServer(async (req, res) => {
         const trackedItems = listTrackedItems();
         for (const item of trackedItems) {
           const query = item.search_query || item.title;
-          let candidates = products.filter((p) => matchScore(query, p.name) >= 0.6);
+          let candidates = products.filter(
+            (p) => matchScore(query, p.name) >= 0.5 || matchScore(p.name, query) >= 0.5
+          );
           if (item.preferred_unit && item.preferred_unit !== "auto") {
             const unitFiltered = candidates.filter((p) => p.unit === item.preferred_unit);
             if (unitFiltered.length > 0) candidates = unitFiltered;
@@ -289,6 +291,20 @@ const server = http.createServer(async (req, res) => {
             insertSnapshot({ trackedItemId: item.id, product: candidates[0] });
             matchedTitles.push(item.title);
           }
+        }
+
+        if (matchedTitles.length === 0 && products.length > 0) {
+          const bestProd = products[0];
+          const newId = createTrackedItem({
+            title: bestProd.name,
+            searchQuery: bestProd.name,
+            mode: "mixed",
+            preferredUnit: bestProd.unit || "auto",
+            category: "Despensa",
+          });
+          insertSnapshot({ trackedItemId: newId, product: bestProd });
+          trackedItem = await refreshTrackedItem(newId);
+          matchedTitles.push(bestProd.name);
         }
       }
 
