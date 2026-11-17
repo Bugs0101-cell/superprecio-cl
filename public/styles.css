@@ -2059,3 +2059,64 @@ textarea {
 .btn-lider-inline:hover {
   background: rgba(37, 99, 235, 0.3);
 }
+
+/* 8. Badges de Stock y Tienda Geográfica */
+.stock-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.67rem;
+  font-weight: 700;
+  padding: 0.1rem 0.45rem;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+
+.stock-pill.stock-ok {
+  background: rgba(16, 185, 129, 0.14);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.35);
+}
+
+.stock-pill.stock-unverified {
+  background: rgba(245, 158, 11, 0.14);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.stock-pill.stock-out {
+  background: rgba(239, 68, 68, 0.2);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.5);
+}
+
+.zone-mini-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.67rem;
+  padding: 0.1rem 0.42rem;
+  border-radius: 99px;
+  background: rgba(56, 189, 248, 0.12);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.is-out-of-stock-row,
+.is-out-of-stock-card {
+  opacity: 0.62;
+  border-color: rgba(239, 68, 68, 0.35) !important;
+}
+
+.out-of-stock-section {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border-radius: var(--radius-md);
+  background: rgba(127, 29, 29, 0.14);
+  border: 1px dashed rgba(239, 68, 68, 0.4);
+}
+
+.out-of-stock-section h4 {
+  margin: 0 0 0.75rem;
+  color: #fca5a5;
+}

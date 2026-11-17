@@ -49,6 +49,22 @@ function renderNutritionSealsHtml(seals = []) {
     .join("")}</div>`;
 }
 
+function renderStockBadgeHtml(inStock = true, stockStatus = "in_stock", storeZone = "") {
+  const isOut = inStock === false || stockStatus === "out_of_stock";
+  let badge = "";
+  if (isOut) {
+    badge = `<span class="stock-pill stock-out" title="Producto agotado / sin stock disponible en tienda">🚫 Sin Stock</span>`;
+  } else if (stockStatus === "unverified_zone") {
+    badge = `<span class="stock-pill stock-unverified" title="La API nacional de esta cadena no valida stock por comuna sin sesión. Verifica o usa el Bookmarklet en tu navegador.">📍 Stock según comuna</span>`;
+  } else {
+    badge = `<span class="stock-pill stock-ok" title="Stock disponible en tienda">✅ Con Stock</span>`;
+  }
+  const zoneTag = storeZone
+    ? `<span class="zone-mini-pill" title="Tienda / Comuna de stock verificado">🗺️ ${storeZone}</span>`
+    : "";
+  return badge + zoneTag;
+}
+
 function getCartChecklistSet(cartId) {
   try {
     const raw = localStorage.getItem(`sp_checklist_${cartId}`);
@@ -229,18 +245,32 @@ async function verifyVisibleLinks({ forceAll = false, showToastFeedback = false 
 
 async function loadTrackedData() {
   try {
-    const [resTracked, resCarts] = await Promise.all([
+    const [resTracked, resCarts, resStores] = await Promise.all([
       fetch("/api/tracked"),
       fetch("/api/carts"),
+      fetch("/api/stores"),
     ]);
     const data = await resTracked.json();
     const cartsData = await resCarts.json();
+    const storesData = await resStores.json().catch(() => ({}));
 
     state.trackedItems = data.items || [];
     state.carts = cartsData.carts || [];
 
-    if (data.settings) {
-      state.settings = data.settings;
+    if (storesData.settings || data.settings) {
+      state.settings = { ...(data.settings || {}), ...(storesData.settings || {}) };
+    }
+
+    const jumboSel = document.getElementById("searchJumboStoreSelect");
+    const savedJumbo = state.settings?.preferredJumboStore || "";
+    if (jumboSel && savedJumbo && !Array.from(jumboSel.options).some((o) => o.value === savedJumbo)) {
+      const opt = document.createElement("option");
+      opt.value = savedJumbo;
+      opt.textContent = `🏬 Local ${savedJumbo} (Guardada)`;
+      opt.selected = true;
+      jumboSel.appendChild(opt);
+    } else if (jumboSel && savedJumbo) {
+      jumboSel.value = savedJumbo;
     }
 
     if (!state.activeCartId && state.carts.length > 0) {
@@ -498,17 +528,27 @@ function renderTrackedCards() {
             ? `<div style="font-size:0.71rem; color:#fbbf24; font-weight:700;">🏷️ c/ promo: ${fmtClp(snap.effective_unit_price)}/${uShort} (${fmtClp(snap.promo_unit_price)}/un)</div>`
             : "";
 
+        const isOutSnap = snap.in_stock === false || snap.stock_status === "out_of_stock";
+        const stockBadgeHtml = renderStockBadgeHtml(
+          snap.in_stock !== false,
+          snap.stock_status || (isOutSnap ? "out_of_stock" : "in_stock"),
+          snap.store_zone || ""
+        );
+
         return `
-          <div class="store-row ${isWinner ? "is-cheapest" : ""} ${snap.is_pure === false || isBrokenLink ? "is-impure-row" : ""}">
+          <div class="store-row ${isWinner && !isOutSnap ? "is-cheapest" : ""} ${
+          snap.is_pure === false || isBrokenLink ? "is-impure-row" : ""
+        } ${isOutSnap ? "is-out-of-stock-row" : ""}">
             <div>
               <span class="store-badge store-${storeId}">${STORE_META[storeId]?.name || storeId}</span>
             </div>
             <div class="store-row-prod">
               <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;">
                 <a href="${snap.product_url || "#"}" target="_blank" rel="noopener" title="${snap.product_name}">
-                  ${isWinner ? "🏆 " : ""}${snap.product_name}
+                  ${isWinner && !isOutSnap ? "🏆 " : ""}${snap.product_name}
                 </a>
                 ${renderLinkBadge(snap.product_url, snap.link_status)}
+                ${stockBadgeHtml}
               </div>
               <div class="store-row-meta">
                 ${snap.brand ? `<span class="brand-mini-pill">🏷️ ${snap.brand}</span>` : ""}
@@ -1196,7 +1236,12 @@ function renderBasketComparison() {
                   : ` · <span style="color:#34d399; font-weight:700;">🚚 Despacho GRATIS</span>`
               }
               <br/>
-              ✅ ${st.foundCount} de ${st.totalItemsCount} productos disponibles
+              ✅ ${st.inStockFoundCount ?? st.foundCount} de ${st.totalItemsCount} disponibles
+              ${
+                st.outOfStockCount > 0
+                  ? `<br/><span style="color:#fca5a5; font-weight:700;">🚫 ${st.outOfStockCount} producto(s) sin stock</span>`
+                  : ""
+              }
               ${
                 st.cardSavingsClp > 0
                   ? `<br/><span style="color:#60a5fa; font-weight:700;">💳 Ahorras ${fmtClp(st.cardSavingsClp)} con tus tarjetas/día</span>`
@@ -1388,6 +1433,7 @@ function renderBasketComparison() {
                   ${p.name.slice(0, 42)}
                 </a>
                 ${renderLinkBadge(p.url, p.linkStatus)}
+                ${renderStockBadgeHtml(p.inStock, p.stockStatus, p.storeZone)}
               </div>
               ${
                 p.pricePer10gProtein
@@ -1642,11 +1688,27 @@ async function executeLiveSearch(query) {
   if (trapsBanner) trapsBanner.style.display = "none";
 
   try {
-    const res = await fetch(`/api/search?q=${encodeURIComponent(q)}&limit=18`);
+    const jumboSel = document.getElementById("searchJumboStoreSelect");
+    const jumboStore = jumboSel ? jumboSel.value : "";
+    const url = `/api/search?q=${encodeURIComponent(q)}&limit=18${
+      jumboStore ? `&jumboStore=${encodeURIComponent(jumboStore)}` : ""
+    }`;
+    const res = await fetch(url);
     const data = await res.json();
     state.liveSearchResults = data.products || [];
     state.liveSearchPackTraps = data.packTraps || [];
     state.liveStoreStatus = data.storeStatus || {};
+    state.discoveredJumboStores = data.discoveredJumboStores || [];
+    if (jumboSel && state.discoveredJumboStores.length > 0) {
+      const prevVal = jumboStore || state.settings?.preferredJumboStore || "";
+      const allCodes = [...new Set([...(prevVal ? [prevVal] : []), ...state.discoveredJumboStores])].sort();
+      jumboSel.innerHTML = [
+        `<option value="">🌐 Todas las tiendas Jumbo (${state.discoveredJumboStores.length} sucursales)</option>`,
+        ...allCodes.map(
+          (code) => `<option value="${code}" ${prevVal === code ? "selected" : ""}>🏬 Local ${code}</option>`
+        ),
+      ].join("");
+    }
     if (btnTrack) btnTrack.style.display = "inline-flex";
 
     if (statusBar) {
@@ -1654,7 +1716,9 @@ async function executeLiveSearch(query) {
         .map(([storeId, st]) => {
           const name = STORE_META[storeId]?.name || storeId;
           if (st.ok) {
-            return `<span class="status-chip">✅ <strong>${name}</strong>: ${st.count} productos (${st.ms} ms)</span>`;
+            const outNote =
+              st.outOfStockCount > 0 ? ` · <span style="color:#fca5a5;">${st.outOfStockCount} agot.</span>` : "";
+            return `<span class="status-chip">✅ <strong>${name}</strong>: ${st.count} prod.${outNote} (${st.ms} ms)</span>`;
           }
           return `<span class="status-chip" style="border-color:#ef4444;">⚠️ <strong>${name}</strong>: ${st.error}</span>`;
         })
@@ -1675,7 +1739,8 @@ async function executeLiveSearch(query) {
 }
 
 function renderSearchProductCard(p, idx, bestUnitPrice) {
-  const isBest = p.unitPrice === bestUnitPrice;
+  const isOut = p.inStock === false || p.stockStatus === "out_of_stock";
+  const isBest = !isOut && bestUnitPrice > 0 && p.unitPrice === bestUnitPrice;
   const discountPct =
     p.listPrice && p.listPrice > p.price
       ? Math.round(((p.listPrice - p.price) / p.listPrice) * 100)
@@ -1721,15 +1786,16 @@ function renderSearchProductCard(p, idx, bestUnitPrice) {
     : "";
 
   return `
-    <div class="product-card ${isBest ? "best-unit-deal" : ""} ${p.isPure === false ? "is-impure-card" : ""}">
+    <div class="product-card ${isBest ? "best-unit-deal" : ""} ${p.isPure === false ? "is-impure-card" : ""} ${isOut ? "is-out-of-stock-card" : ""}">
       <div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-          <div style="display:flex; align-items:center; gap:0.35rem;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem; gap:0.35rem; flex-wrap:wrap;">
+          <div style="display:flex; align-items:center; gap:0.35rem; flex-wrap:wrap;">
             <span class="store-badge store-${p.store}">${p.storeName}</span>
             ${renderLinkBadge(p.url, p.linkStatus)}
+            ${renderStockBadgeHtml(p.inStock, p.stockStatus, p.storeZone)}
           </div>
           ${isBest ? `<span class="best-deal-ribbon">🏆 MEJOR $/UNIDAD</span>` : ""}
-          ${!isBest && discountPct > 0 ? `<span class="savings-badge">-${discountPct}%</span>` : ""}
+          ${!isBest && !isOut && discountPct > 0 ? `<span class="savings-badge">-${discountPct}%</span>` : ""}
         </div>
 
         <div class="product-card-head">
@@ -1847,7 +1913,15 @@ function renderLiveSearchResults() {
     }
   }
 
+  const stockFilterEl = document.getElementById("searchStockFilter");
+  const stockFilter = stockFilterEl ? stockFilterEl.value : "all";
+
   let basePool = [...state.liveSearchResults];
+  if (stockFilter === "confirmed") {
+    basePool = basePool.filter((p) => p.inStock !== false && p.stockStatus === "in_stock");
+  } else if (stockFilter === "avail") {
+    basePool = basePool.filter((p) => p.inStock !== false && p.stockStatus !== "out_of_stock");
+  }
   if (unitFilter !== "all") {
     basePool = basePool.filter((p) => p.unit === unitFilter);
   }
@@ -1963,13 +2037,37 @@ function renderLiveSearchResults() {
     return (b.relevance || 0) - (a.relevance || 0);
   });
 
-  const bestUnitPrice = Math.min(...filtered.map((p) => p.unitPrice));
+  // Separar explícitamente disponibles/cotizables de productos agotados
+  const availEntries = [];
+  const outEntries = [];
+  filtered.forEach((p, idx) => {
+    if (p.inStock === false || p.stockStatus === "out_of_stock") {
+      outEntries.push({ p, idx });
+    } else {
+      availEntries.push({ p, idx });
+    }
+  });
+
+  const bestUnitPrice =
+    availEntries.length > 0 ? Math.min(...availEntries.map(({ p }) => p.unitPrice)) : 0;
+
+  const outSectionHtml =
+    outEntries.length > 0
+      ? `
+        <section class="out-of-stock-section">
+          <h4>🚫 Productos Sin Stock / Agotados (${outEntries.length})</h4>
+          <div class="search-results-grid">
+            ${outEntries.map(({ p, idx }) => renderSearchProductCard(p, idx, 0)).join("")}
+          </div>
+        </section>
+      `
+      : "";
 
   if (container) {
     if (viewMode === "by_brand") {
       container.className = "brand-groups-wrap";
       const groupsMap = {};
-      filtered.forEach((p, idx) => {
+      availEntries.forEach(({ p, idx }) => {
         const bName = p.brand || "Genérico / Marca Propia";
         if (!groupsMap[bName]) groupsMap[bName] = [];
         groupsMap[bName].push({ p, idx });
@@ -1996,51 +2094,60 @@ function renderLiveSearchResults() {
         ...sortedGroups.map(([, entries]) => Math.min(...entries.map((x) => x.p.unitPrice || 1)))
       );
 
-      container.innerHTML = sortedGroups
-        .map(([bName, entries]) => {
-          const firstP = entries[0].p;
-          const uLbl = firstP.unit === "kg" ? "kg" : firstP.unit === "lt" ? "L" : "un";
-          const minUnit = Math.min(...entries.map((x) => x.p.unitPrice));
-          const brandBarPct = Math.max(
-            12,
-            Math.min(100, Math.round((minUnit / maxBrandMinUnit) * 100))
-          );
-          const protPrices = entries
-            .map((x) => x.p.pricePer10gProtein)
-            .filter((v) => v && v > 0);
-          const minProt = protPrices.length > 0 ? Math.min(...protPrices) : null;
-          const maxScore = Math.max(...entries.map((x) => x.p.nutritionScore || 0));
+      const brandHtml =
+        sortedGroups.length > 0
+          ? sortedGroups
+              .map(([bName, entries]) => {
+                const firstP = entries[0].p;
+                const uLbl = firstP.unit === "kg" ? "kg" : firstP.unit === "lt" ? "L" : "un";
+                const minUnit = Math.min(...entries.map((x) => x.p.unitPrice));
+                const brandBarPct = Math.max(
+                  12,
+                  Math.min(100, Math.round((minUnit / maxBrandMinUnit) * 100))
+                );
+                const protPrices = entries
+                  .map((x) => x.p.pricePer10gProtein)
+                  .filter((v) => v && v > 0);
+                const minProt = protPrices.length > 0 ? Math.min(...protPrices) : null;
+                const maxScore = Math.max(...entries.map((x) => x.p.nutritionScore || 0));
 
-          return `
-            <section class="brand-group-section">
-              <div class="brand-group-header" style="flex-direction:column; align-items:stretch;">
-                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
-                  <div style="display:flex; align-items:center; gap:0.65rem; flex-wrap:wrap;">
-                    <span class="brand-group-title">🏢 ${bName}</span>
-                    <span class="small-muted">${entries.length} ${entries.length === 1 ? "formato" : "formatos / tiendas"}</span>
-                  </div>
-                  <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                    <span class="savings-badge">Mejor $/u: ${fmtClp(minUnit)}/${uLbl}</span>
-                    ${minProt ? `<span class="protein-tag" style="margin:0;">🥩 Desde ${fmtClp(minProt)}/10g prot</span>` : ""}
-                    ${maxScore > 0 ? `<span class="nutrition-badge ${maxScore >= 90 ? "grade-aplus" : maxScore >= 80 ? "grade-a" : "grade-b"}">Score máx ${maxScore}/100</span>` : ""}
-                  </div>
-                </div>
-                <div class="brand-bar-strip" title="Comparativa del mejor $/unidad de ${bName} frente al rango de marcas">
-                  <div class="brand-bar-strip-fill" style="width:${brandBarPct}%;"></div>
-                </div>
-              </div>
-              <div class="search-results-grid">
-                ${entries.map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice)).join("")}
-              </div>
-            </section>
-          `;
-        })
-        .join("");
+                return `
+                  <section class="brand-group-section">
+                    <div class="brand-group-header" style="flex-direction:column; align-items:stretch;">
+                      <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
+                        <div style="display:flex; align-items:center; gap:0.65rem; flex-wrap:wrap;">
+                          <span class="brand-group-title">🏢 ${bName}</span>
+                          <span class="small-muted">${entries.length} ${entries.length === 1 ? "formato" : "formatos / tiendas"}</span>
+                        </div>
+                        <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                          <span class="savings-badge">Mejor $/u: ${fmtClp(minUnit)}/${uLbl}</span>
+                          ${minProt ? `<span class="protein-tag" style="margin:0;">🥩 Desde ${fmtClp(minProt)}/10g prot</span>` : ""}
+                          ${maxScore > 0 ? `<span class="nutrition-badge ${maxScore >= 90 ? "grade-aplus" : maxScore >= 80 ? "grade-a" : "grade-b"}">Score máx ${maxScore}/100</span>` : ""}
+                        </div>
+                      </div>
+                      <div class="brand-bar-strip" title="Comparativa del mejor $/unidad de ${bName} frente al rango de marcas">
+                        <div class="brand-bar-strip-fill" style="width:${brandBarPct}%;"></div>
+                      </div>
+                    </div>
+                    <div class="search-results-grid">
+                      ${entries.map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice)).join("")}
+                    </div>
+                  </section>
+                `;
+              })
+              .join("")
+          : `<div class="empty-state">No hay productos con stock en esta selección. Revisa los agotados abajo.</div>`;
+
+      container.innerHTML = brandHtml + outSectionHtml;
     } else {
-      container.className = "search-results-grid";
-      container.innerHTML = filtered
-        .map((p, idx) => renderSearchProductCard(p, idx, bestUnitPrice))
-        .join("");
+      container.className = "brand-groups-wrap";
+      const availGrid =
+        availEntries.length > 0
+          ? `<div class="search-results-grid">${availEntries
+              .map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice))
+              .join("")}</div>`
+          : `<div class="empty-state">No hay productos con stock en esta selección.</div>`;
+      container.innerHTML = availGrid + outSectionHtml;
     }
 
     container.querySelectorAll(".btn-add-search-to-cart").forEach((btn) => {
@@ -2429,13 +2536,41 @@ async function configureDynamicBookmarklet() {
   const bookmarkletFn = function (ep, orig) {
     try {
       var isCart = location.pathname.indexOf("/cart") !== -1;
+      var host = (location.hostname || "").toLowerCase();
+      var isLider = host.indexOf("lider.cl") !== -1;
       var raw = "";
       var cartItems = [];
+      var browserItems = [];
+      var storeZone = "";
+      try {
+        var hdrTxt = (document.body.innerText || "").slice(0, 1200);
+        var zMatch = hdrTxt.match(/(?:Env[ií]o a:|Retiro en|Comuna:|Despacho[^:\n]*:)\s*([^\n|]{3,45})/i);
+        if (zMatch && zMatch[1]) {
+          storeZone = zMatch[1].replace(/\s+/g, " ").trim();
+        }
+      } catch (ez) {}
       var nextEl = document.getElementById("__NEXT_DATA__");
       if (nextEl) {
         raw = nextEl.textContent || "";
       }
-      if (isCart) {
+      if (!isLider && !isCart) {
+        var bodyTxt = (document.body.innerText || "").slice(0, 5000);
+        var isOut = /justo se agot[oó]|producto agotado|sin stock|no disponible para esta direcci[oó]n/i.test(bodyTxt);
+        var h1El = document.querySelector("h1");
+        var titleTxt = h1El ? (h1El.textContent || "").trim() : "";
+        var pMatch = bodyTxt.match(/\$[\s]*[\d.]{3,9}/);
+        if (titleTxt) {
+          browserItems.push({
+            name: titleTxt,
+            url: location.href,
+            unitPrice: pMatch ? pMatch[0] : "",
+            inStock: !isOut,
+            stockStatus: isOut ? "out_of_stock" : "in_stock",
+            storeZone: storeZone,
+          });
+        }
+      }
+      if (isCart && isLider) {
         var seenHref = {};
         var anchors = Array.prototype.slice.call(document.querySelectorAll('a[href*="/ip/"]'));
         anchors.forEach(function (a) {
@@ -2519,6 +2654,8 @@ async function configureDynamicBookmarklet() {
           mode: isCart ? "cart" : "auto",
           rawContent: raw,
           cartItems: cartItems,
+          browserItems: browserItems,
+          storeZone: storeZone,
           url: location.href,
         })
       );
@@ -2919,10 +3056,26 @@ window.addEventListener("DOMContentLoaded", () => {
     });
   });
 
-  ["searchSortSelect", "searchUnitFilter", "searchStoreFilter", "searchViewModeSelect", "searchPureOnlyCheckbox"].forEach((id) => {
+  ["searchSortSelect", "searchUnitFilter", "searchStoreFilter", "searchViewModeSelect", "searchStockFilter", "searchPureOnlyCheckbox"].forEach((id) => {
     document.getElementById(id)?.addEventListener("change", () => {
       if (state.liveSearchResults.length > 0) renderLiveSearchResults();
     });
+  });
+
+  document.getElementById("searchJumboStoreSelect")?.addEventListener("change", async (e) => {
+    const val = e.target.value || "";
+    try {
+      await fetch("/api/settings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ preferredJumboStore: val }),
+      });
+      state.settings.preferredJumboStore = val;
+      if (state.liveSearchQuery) {
+        await executeLiveSearch(state.liveSearchQuery);
+      }
+      showToast(val ? `Sucursal Jumbo filtrada y guardada: ${val}` : "Filtro Jumbo ampliado a todas las sucursales.");
+    } catch {}
   });
 
   document.getElementById("searchBrandFilter")?.addEventListener("change", (e) => {

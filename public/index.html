@@ -492,6 +492,22 @@
             </select>
           </div>
 
+          <div class="filter-group">
+            <label>Disponibilidad / Stock:</label>
+            <select id="searchStockFilter">
+              <option value="all">🔀 Separar Con Stock / Agotados</option>
+              <option value="avail">✅ Ocultar Agotados</option>
+              <option value="confirmed">📦 Solo stock confirmado ✅</option>
+            </select>
+          </div>
+
+          <div class="filter-group">
+            <label title="Filtra stock real en sucursal Jumbo específica (códigos SellerVSS detectados) y guarda tu tienda preferida">Sucursal Jumbo (Stock local):</label>
+            <select id="searchJumboStoreSelect">
+              <option value="">🌐 Todas las tiendas Jumbo</option>
+            </select>
+          </div>
+
           <div class="filter-group" style="display:flex; align-items:flex-end; padding-bottom:0.35rem;">
             <label class="checkbox-chip" title="Oculta productos de otra variedad (ej. oculta Aceite de Maravilla si buscas Canola, o Leche normal si buscas Protein)">
               <input type="checkbox" id="searchPureOnlyCheckbox" checked />
