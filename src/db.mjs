@@ -2,6 +2,12 @@ import { DatabaseSync } from "node:sqlite";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  checkProductPurity,
+  estimateProteinMetrics,
+  extractQuantityFromText,
+  inferBrand,
+} from "./normalizer.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR =
@@ -351,8 +357,34 @@ export function enrichTrackedItemWithStats(item) {
       }
     }
 
+    const spec = extractQuantityFromText(latest.product_name, latest.format_label || "");
+    const baseAmt = spec?.baseAmount || 1;
+    const brandClean = inferBrand(latest.product_name, latest.brand);
+    const nut = estimateProteinMetrics(
+      latest.product_name,
+      latest.unit,
+      baseAmt,
+      latest.price,
+      brandClean
+    );
+    const purity = checkProductPurity(
+      item.search_query || item.title,
+      latest.product_name,
+      brandClean
+    );
+
     latestByStore[store] = {
       ...latest,
+      brand: brandClean,
+      protein_price: nut.pricePer10gProtein,
+      protein_grams_total: nut.proteinGramsTotal,
+      protein_per_100g: nut.proteinPer100g,
+      nutrition_score: nut.nutritionScore,
+      nutrition_grade: nut.nutritionGrade,
+      nutrition_badge: nut.nutritionBadge,
+      is_pure: purity.isPure,
+      is_blend: purity.isBlend,
+      purity_warning: purity.purityWarning,
       signal,
       signalLabel,
       signalExplanation,
@@ -380,13 +412,26 @@ export function enrichTrackedItemWithStats(item) {
   }
 
   const activeLatest = Object.values(latestByStore);
-  activeLatest.sort((a, b) => a.unit_price - b.unit_price);
+  const purePool = activeLatest.filter((s) => s.is_pure !== false);
+  const candidatePool = purePool.length > 0 ? purePool : activeLatest;
 
-  const bestByUnitPrice = activeLatest[0] || null;
-  const worstByUnitPrice =
-    activeLatest.length > 1 ? activeLatest[activeLatest.length - 1] : null;
+  const byUnit = [...candidatePool].sort((a, b) => a.unit_price - b.unit_price);
+  const bestByUnitPrice = byUnit[0] || null;
+  const worstByUnitPrice = byUnit.length > 1 ? byUnit[byUnit.length - 1] : null;
 
-  const byTotal = [...activeLatest].sort((a, b) => a.price - b.price);
+  const withProtein = candidatePool.filter((s) => s.protein_price > 0);
+  withProtein.sort((a, b) => a.protein_price - b.protein_price || a.unit_price - b.unit_price);
+  const bestByProteinPrice = withProtein[0] || null;
+
+  const withNutrition = candidatePool.filter((s) => s.nutrition_score > 0);
+  withNutrition.sort(
+    (a, b) =>
+      b.nutrition_score - a.nutrition_score ||
+      (a.protein_price || a.unit_price) - (b.protein_price || b.unit_price)
+  );
+  const bestByNutritionScore = withNutrition[0] || null;
+
+  const byTotal = [...candidatePool].sort((a, b) => a.price - b.price);
   const bestByTotalPrice = byTotal[0] || null;
 
   const maxSavingsPct =
@@ -404,6 +449,8 @@ export function enrichTrackedItemWithStats(item) {
     latestByStore,
     variabilityByStore,
     bestByUnitPrice,
+    bestByProteinPrice,
+    bestByNutritionScore,
     bestByTotalPrice,
     maxSavingsPct,
     totalSnapshots: snapshots.length,

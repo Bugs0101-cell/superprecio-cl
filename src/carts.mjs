@@ -4,7 +4,12 @@ import {
   getTodayDayIndex,
   getWeekdayName,
 } from "./discounts.mjs";
-import { extractQuantityFromText } from "./normalizer.mjs";
+import {
+  checkProductPurity,
+  estimateProteinMetrics,
+  extractQuantityFromText,
+  inferBrand,
+} from "./normalizer.mjs";
 import { searchAllStores, STORES } from "./scrapers.mjs";
 
 const ALL_STORES = ["jumbo", "santaisabel", "unimarc", "tottus", "lider"];
@@ -59,24 +64,57 @@ function detectDominantUnit(products, preferredUnit) {
 function toCartCandidate(p, storeOverride = null) {
   const store = storeOverride || p.store;
   const spec = extractQuantityFromText(p.name, p.formatLabel);
+  const unit = p.unit || spec?.unit || "un";
+  const baseAmount = p.baseAmount || spec?.baseAmount || 1;
+  const brand = inferBrand(p.name, p.brand);
+  const nut = estimateProteinMetrics(p.name, unit, baseAmount, p.price, brand);
+
   return {
     externalId: String(p.externalId || p.sku),
     sku: String(p.sku || p.externalId),
     store,
     name: p.name,
-    brand: p.brand || "",
+    brand,
     price: p.price,
     listPrice: p.listPrice || null,
     bundlePricePerItem: p.bundlePricePerItem || null,
     promoText: p.promoText || null,
-    unit: p.unit || "un",
+    unit,
     unitPrice: p.unitPrice,
     effectiveUnitPrice: p.effectiveUnitPrice || p.unitPrice,
-    baseAmount: p.baseAmount || spec?.baseAmount || 1,
-    formatLabel: p.formatLabel || `1 ${p.unit || "un"}`,
+    baseAmount,
+    formatLabel: p.formatLabel || `1 ${unit}`,
     pricePer100: p.pricePer100 || Math.round(p.unitPrice / 10),
+    hasProteinData: nut.hasProteinData,
+    proteinGramsTotal: nut.proteinGramsTotal,
+    proteinPer100g: nut.proteinPer100g,
+    pricePer10gProtein: nut.pricePer10gProtein,
+    nutritionScore: nut.nutritionScore,
+    nutritionGrade: nut.nutritionGrade,
+    nutritionBadge: nut.nutritionBadge,
     url: p.url || "",
     imageUrl: p.imageUrl || "",
+  };
+}
+
+function enrichCartCandidate(c, searchQuery) {
+  getCandidateSpec(c);
+  const brand = inferBrand(c.name, c.brand);
+  const nut = estimateProteinMetrics(c.name, c.unit, c.baseAmount, c.price, brand);
+  const purity = checkProductPurity(searchQuery, c.name, brand);
+  return {
+    ...c,
+    brand,
+    hasProteinData: nut.hasProteinData,
+    proteinGramsTotal: nut.proteinGramsTotal,
+    proteinPer100g: nut.proteinPer100g,
+    pricePer10gProtein: nut.pricePer10gProtein,
+    nutritionScore: nut.nutritionScore,
+    nutritionGrade: nut.nutritionGrade,
+    nutritionBadge: nut.nutritionBadge,
+    isPure: purity.isPure,
+    isBlend: purity.isBlend,
+    purityWarning: purity.purityWarning,
   };
 }
 
@@ -165,6 +203,27 @@ function computeLinePricing(candidate, quantity) {
  * - Calcula la mejor combinación de 2 supermercados
  * - Calcula el carrito óptimo dividido (cada producto donde es más barato)
  */
+function compareByCartCriteria(prodA, prodB, lineA, lineB, criteria) {
+  const pureA = prodA.isPure !== false ? 0 : 1;
+  const pureB = prodB.isPure !== false ? 0 : 1;
+  if (pureA !== pureB) return pureA - pureB;
+
+  if (criteria === "protein_price") {
+    const pA = prodA.pricePer10gProtein || 9999999;
+    const pB = prodB.pricePer10gProtein || 9999999;
+    return pA - pB || (prodA.unitPrice || 0) - (prodB.unitPrice || 0);
+  }
+  if (criteria === "nutrition_score") {
+    const sA = prodA.nutritionScore || 0;
+    const sB = prodB.nutritionScore || 0;
+    return sB - sA || (prodA.unitPrice || 0) - (prodB.unitPrice || 0);
+  }
+  if (criteria === "total_price") {
+    return lineA - lineB || (prodA.unitPrice || 0) - (prodB.unitPrice || 0);
+  }
+  return (prodA.unitPrice || 0) - (prodB.unitPrice || 0) || lineA - lineB;
+}
+
 export function evaluateCart(cartRow) {
   const rawItems = db
     .prepare("SELECT * FROM cart_items WHERE cart_id = ? ORDER BY id ASC")
@@ -233,24 +292,29 @@ export function evaluateCart(cartRow) {
     };
 
     const storeOffers = {};
+    const qCheck = row.search_query || row.label;
 
     for (const storeId of ALL_STORES) {
-      const candidates = Array.isArray(candidatesByStore[storeId])
-        ? [...candidatesByStore[storeId]]
+      const rawCandidates = Array.isArray(candidatesByStore[storeId])
+        ? candidatesByStore[storeId]
         : [];
-      if (candidates.length === 0) continue;
+      if (rawCandidates.length === 0) continue;
 
-      // Ordenar priorizando formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
+      const candidates = rawCandidates.map((c) => enrichCartCandidate(c, qCheck));
+
+      // Ordenar priorizando equivalencia de pureza, formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
       candidates.sort((a, b) => {
+        const pureA = a.isPure !== false ? 0 : 1;
+        const pureB = b.isPure !== false ? 0 : 1;
+        if (pureA !== pureB) return pureA - pureB;
+
         const closeA = getSizeRatio(a) <= 2.2 ? 0 : 1;
         const closeB = getSizeRatio(b) <= 2.2 ? 0 : 1;
         if (closeA !== closeB) return closeA - closeB;
-        if (criteria === "total_price") {
-          const lineA = (a.price || 0) * getScaledQty(a);
-          const lineB = (b.price || 0) * getScaledQty(b);
-          return lineA - lineB || a.unitPrice - b.unitPrice;
-        }
-        return a.unitPrice - b.unitPrice || a.price - b.price;
+
+        const lineA = (a.price || 0) * getScaledQty(a);
+        const lineB = (b.price || 0) * getScaledQty(b);
+        return compareByCartCriteria(a, b, lineA, lineB, criteria);
       });
 
       const manualSku = selectedByStore[storeId];
@@ -288,12 +352,9 @@ export function evaluateCart(cartRow) {
 
     // Determinar qué supermercado gana en este ítem del carrito
     const availableOffers = Object.values(storeOffers);
-    availableOffers.sort((a, b) => {
-      if (criteria === "total_price") {
-        return a.lineTotal - b.lineTotal || a.product.unitPrice - b.product.unitPrice;
-      }
-      return a.product.unitPrice - b.product.unitPrice || a.lineTotal - b.lineTotal;
-    });
+    availableOffers.sort((a, b) =>
+      compareByCartCriteria(a.product, b.product, a.lineTotal, b.lineTotal, criteria)
+    );
 
     const bestOffer = availableOffers[0] || null;
     const worstOffer =
@@ -326,6 +387,10 @@ export function evaluateCart(cartRow) {
     let normalTotalClp = 0;
     let discountedTotalClp = 0;
     let foundCount = 0;
+    let totalProteinGramsRaw = 0;
+    let proteinSpendClp = 0;
+    let scoreSum = 0;
+    let scoreCount = 0;
     const missingItems = [];
 
     for (const item of items) {
@@ -335,6 +400,15 @@ export function evaluateCart(cartRow) {
         normalTotalClp += offer.normalLineTotal;
         discountedTotalClp += offer.discountedLineTotal;
         foundCount++;
+        const protGrams = (offer.product?.proteinGramsTotal || 0) * (offer.qty || 1);
+        if (protGrams > 0) {
+          totalProteinGramsRaw += protGrams;
+          proteinSpendClp += offer.lineTotal;
+        }
+        if (offer.product?.nutritionScore > 0) {
+          scoreSum += offer.product.nutritionScore;
+          scoreCount++;
+        }
       } else {
         missingItems.push(item.label);
       }
@@ -344,6 +418,10 @@ export function evaluateCart(cartRow) {
       const deliveryFee =
         enableFriction && totalClp < freeDeliveryThreshold ? deliveryCost : 0;
       const netTotalClp = totalClp + deliveryFee;
+      const totalProteinGrams = Math.round(totalProteinGramsRaw);
+      const avgCostPer10gProtein =
+        totalProteinGrams > 0 ? Math.round(proteinSpendClp / (totalProteinGrams / 10)) : null;
+      const avgNutritionScore = scoreCount > 0 ? Math.round(scoreSum / scoreCount) : null;
 
       singleStoreRanking.push({
         store: storeId,
@@ -360,6 +438,10 @@ export function evaluateCart(cartRow) {
         missingCount: totalItemsCount - foundCount,
         missingItems,
         isComplete: foundCount === totalItemsCount,
+        totalProteinGrams,
+        proteinSpendClp,
+        avgCostPer10gProtein,
+        avgNutritionScore,
       });
     }
   }
@@ -405,9 +487,7 @@ export function evaluateCart(cartRow) {
     if (offers.length === 0) continue;
 
     offers.sort((a, b) =>
-      criteria === "total_price"
-        ? a.lineTotal - b.lineTotal
-        : a.product.unitPrice - b.product.unitPrice || a.lineTotal - b.lineTotal
+      compareByCartCriteria(a.product, b.product, a.lineTotal, b.lineTotal, criteria)
     );
     const chosen = offers[0];
     splitTotalClp += chosen.lineTotal;
@@ -433,6 +513,7 @@ export function evaluateCart(cartRow) {
       lineTotal: chosen.lineTotal,
       unitPrice: chosen.product.unitPrice,
       unit: chosen.product.unit,
+      pricePer10gProtein: chosen.product.pricePer10gProtein || null,
       url: chosen.product.url,
     });
   }
@@ -529,6 +610,51 @@ export function evaluateCart(cartRow) {
     }
   }
 
+  const storesWithProtein = singleStoreRanking.filter((s) => s.totalProteinGrams > 0);
+  storesWithProtein.sort(
+    (a, b) =>
+      (a.avgCostPer10gProtein || 999999) - (b.avgCostPer10gProtein || 999999) ||
+      b.totalProteinGrams - a.totalProteinGrams
+  );
+  const bestProteinStore = storesWithProtein[0]
+    ? {
+        store: storesWithProtein[0].store,
+        storeName: storesWithProtein[0].storeName,
+        totalProteinGrams: storesWithProtein[0].totalProteinGrams,
+        avgCostPer10gProtein: storesWithProtein[0].avgCostPer10gProtein,
+      }
+    : null;
+
+  const topProteinItems = items
+    .map((item) => {
+      const proteinOffers = Object.values(item.storeOffers)
+        .filter((o) => (o.product?.proteinGramsTotal || 0) > 0)
+        .sort(
+          (a, b) =>
+            (a.product.pricePer10gProtein || 999999) -
+            (b.product.pricePer10gProtein || 999999)
+        );
+      if (proteinOffers.length === 0) return null;
+      const bestProt = proteinOffers[0];
+      const totalGrams = Math.round(
+        (bestProt.product.proteinGramsTotal || 0) * (bestProt.qty || 1)
+      );
+      return {
+        label: item.label,
+        totalProteinGrams: totalGrams,
+        bestProteinStore: STORES[bestProt.store]?.name || bestProt.store,
+        bestPricePer10g: bestProt.product.pricePer10gProtein,
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.totalProteinGrams - a.totalProteinGrams)
+    .slice(0, 5);
+
+  const cartNutritionSummary = {
+    bestProteinStore,
+    topProteinItems,
+  };
+
   return {
     id: cartRow.id,
     name: cartRow.name,
@@ -549,6 +675,7 @@ export function evaluateCart(cartRow) {
     frictionVerdict,
     frictionVerdictMsg,
     netSavingsClp,
+    cartNutritionSummary,
     optimalSplitCart: {
       totalClp: splitTotalClp,
       deliveryFeesClp: splitTotalDeliveryFees,

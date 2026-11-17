@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
 import {
+  checkProductPurity,
   detectPackTraps,
   enrichUnitMetrics,
   estimateProteinMetrics,
+  inferBrand,
   matchScore,
   normalizeUnit,
   parseBundle,
@@ -10,6 +12,28 @@ import {
   parseUnitPriceString,
   toClp,
 } from "./normalizer.mjs";
+
+function resolveBrandAndNutrition(name, rawBrand, unitMetrics, price) {
+  const brand = inferBrand(name, rawBrand);
+  const nutrition = estimateProteinMetrics(
+    name,
+    unitMetrics.unit,
+    unitMetrics.baseAmount,
+    price,
+    brand
+  );
+  return {
+    brand,
+    hasProteinData: nutrition.hasProteinData,
+    hasNutritionData: nutrition.hasNutritionData,
+    proteinGramsTotal: nutrition.proteinGramsTotal,
+    proteinPer100g: nutrition.proteinPer100g,
+    pricePer10gProtein: nutrition.pricePer10gProtein,
+    nutritionScore: nutrition.nutritionScore,
+    nutritionGrade: nutrition.nutritionGrade,
+    nutritionBadge: nutrition.nutritionBadge,
+  };
+}
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -171,12 +195,7 @@ function mapCencosudItem(cfg, result) {
   const productUrl =
     rawUrl || (detailUrl ? `${cfg.siteBaseUrl}${detailUrl}` : `${cfg.siteBaseUrl}`);
 
-  const protein = estimateProteinMetrics(
-    name,
-    unitMetrics.unit,
-    unitMetrics.baseAmount,
-    price
-  );
+  const nutFields = resolveBrandAndNutrition(name, data.BrandName, unitMetrics, price);
 
   return {
     store: cfg.storeId,
@@ -184,7 +203,6 @@ function mapCencosudItem(cfg, result) {
     externalId: String(data.id),
     sku: data.ProductRefId ? String(data.ProductRefId) : String(data.id),
     name: String(name).trim(),
-    brand: data.BrandName ? String(data.BrandName).trim() : "",
     price,
     listPrice: listPrice ?? null,
     memberPrice: null,
@@ -199,10 +217,7 @@ function mapCencosudItem(cfg, result) {
     per100UnitName: unitMetrics.per100UnitName,
     pricePerSmallUnit: unitMetrics.pricePerSmallUnit,
     smallUnitName: unitMetrics.smallUnitName,
-    hasProteinData: protein.hasProteinData,
-    proteinGramsTotal: protein.proteinGramsTotal,
-    proteinPer100g: protein.proteinPer100g,
-    pricePer10gProtein: protein.pricePer10gProtein,
+    ...nutFields,
     imageUrl: data.image_url || "",
     url: productUrl,
     inStock,
@@ -292,12 +307,7 @@ function mapUnimarcItem(p) {
     ? `https://www.unimarc.cl/product${item.slug.startsWith("/") ? item.slug : "/" + item.slug}`
     : "https://www.unimarc.cl";
 
-  const protein = estimateProteinMetrics(
-    item.name,
-    unitMetrics.unit,
-    unitMetrics.baseAmount,
-    price
-  );
+  const nutFields = resolveBrandAndNutrition(item.name, item.brand, unitMetrics, price);
 
   return {
     store: "unimarc",
@@ -306,7 +316,6 @@ function mapUnimarcItem(p) {
     sku: String(item.sku),
     ean: item.ean || null,
     name: String(item.name).trim(),
-    brand: item.brand ? String(item.brand).trim() : "",
     price,
     listPrice: listPrice ?? null,
     memberPrice,
@@ -321,10 +330,7 @@ function mapUnimarcItem(p) {
     per100UnitName: unitMetrics.per100UnitName,
     pricePerSmallUnit: unitMetrics.pricePerSmallUnit,
     smallUnitName: unitMetrics.smallUnitName,
-    hasProteinData: protein.hasProteinData,
-    proteinGramsTotal: protein.proteinGramsTotal,
-    proteinPer100g: protein.proteinPer100g,
-    pricePer10gProtein: protein.pricePer10gProtein,
+    ...nutFields,
     imageUrl: item.images?.[0] || "",
     url: productUrl,
     inStock: true,
@@ -409,12 +415,7 @@ function mapTottusItem(p) {
       ? Math.round(bundlePromo.unitPriceInBundle / unitMetrics.baseAmount)
       : unitMetrics.unitPrice;
 
-  const protein = estimateProteinMetrics(
-    p.displayName,
-    unitMetrics.unit,
-    unitMetrics.baseAmount,
-    price
-  );
+  const nutFields = resolveBrandAndNutrition(p.displayName, p.brand, unitMetrics, price);
 
   return {
     store: "tottus",
@@ -422,7 +423,6 @@ function mapTottusItem(p) {
     externalId: String(p.skuId ?? p.productId),
     sku: String(p.productId ?? p.skuId),
     name: String(p.displayName).trim(),
-    brand: p.brand ? String(p.brand).trim() : "",
     price,
     listPrice: listPrice ?? null,
     memberPrice,
@@ -437,10 +437,7 @@ function mapTottusItem(p) {
     per100UnitName: unitMetrics.per100UnitName,
     pricePerSmallUnit: unitMetrics.pricePerSmallUnit,
     smallUnitName: unitMetrics.smallUnitName,
-    hasProteinData: protein.hasProteinData,
-    proteinGramsTotal: protein.proteinGramsTotal,
-    proteinPer100g: protein.proteinPer100g,
-    pricePer10gProtein: protein.pricePer10gProtein,
+    ...nutFields,
     imageUrl: p.mediaUrls?.[0] || "",
     url: p.url || "https://www.tottus.cl",
     inStock: true,
@@ -516,12 +513,7 @@ function buildNormalizedLiderProduct({
     description,
   });
 
-  const protein = estimateProteinMetrics(
-    name,
-    unitMetrics.unit,
-    unitMetrics.baseAmount,
-    price
-  );
+  const nutFields = resolveBrandAndNutrition(name, brand, unitMetrics, price);
 
   return {
     store: "lider",
@@ -529,7 +521,6 @@ function buildNormalizedLiderProduct({
     externalId: String(id),
     sku: String(id),
     name: String(name).trim(),
-    brand: brand ? String(brand).trim() : "",
     price,
     listPrice: listPrice ?? null,
     memberPrice: memberPrice ?? null,
@@ -544,10 +535,7 @@ function buildNormalizedLiderProduct({
     per100UnitName: unitMetrics.per100UnitName,
     pricePerSmallUnit: unitMetrics.pricePerSmallUnit,
     smallUnitName: unitMetrics.smallUnitName,
-    hasProteinData: protein.hasProteinData,
-    proteinGramsTotal: protein.proteinGramsTotal,
-    proteinPer100g: protein.proteinPer100g,
-    pricePer10gProtein: protein.pricePer10gProtein,
+    ...nutFields,
     imageUrl: imageUrl || "",
     url,
     inStock,
@@ -781,15 +769,25 @@ export async function searchAllStores(query, options = {}) {
       const t0 = Date.now();
       try {
         const items = await fn(query);
-        const scored = items
-          .map((item) => ({
+        const enriched = items.map((item) => {
+          const purity = checkProductPurity(query, item.name, item.brand);
+          return {
             ...item,
+            isPure: purity.isPure,
+            isBlend: purity.isBlend,
+            purityWarning: purity.purityWarning,
             relevance: matchScore(query, `${item.name} ${item.brand || ""} ${item.formatLabel || ""}`),
-          }))
-          .filter((item) => item.relevance >= minRelevance);
+          };
+        });
+        const scored = enriched.filter((item) => item.relevance >= minRelevance);
 
-        // Si el filtro estricto deja 0 pero la tienda devolvió productos, mantenemos los primeros 5
-        const finalItems = scored.length > 0 ? scored : items.slice(0, 5).map((i) => ({ ...i, relevance: 0.4 }));
+        // Fallback seguro: nunca inyectar productos impuros (ej. Maravilla cuando se busca Canola)
+        const pureFallback = enriched
+          .filter((i) => options.allowImpureFallback === true || i.isPure !== false)
+          .slice(0, 5)
+          .map((i) => ({ ...i, relevance: Math.max(0.4, i.relevance || 0) }));
+
+        const finalItems = scored.length > 0 ? scored : pureFallback;
         allProducts.push(...finalItems);
         storeStatus[storeId] = {
           ok: true,

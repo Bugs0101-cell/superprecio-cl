@@ -6,6 +6,7 @@ import {
   listTrackedItems,
   setSetting,
 } from "./db.mjs";
+import { checkProductPurity } from "./normalizer.mjs";
 import { searchAllStores, STORES } from "./scrapers.mjs";
 import { formatPriceAlertMessage, sendTelegramNotification } from "./telegram.mjs";
 
@@ -84,14 +85,26 @@ export async function refreshTrackedItem(trackedItemId) {
       });
 
       const targetUnit = detectDominantUnit(res.products, item.preferred_unit);
+      const qCheck = item.search_query || item.title;
 
       for (const storeId of remainingStores) {
         const storeItems = res.products.filter((p) => p.store === storeId);
         if (storeItems.length === 0) continue;
 
+        const pureItems = storeItems.filter(
+          (p) =>
+            p.isPure !== false &&
+            checkProductPurity(qCheck, p.name, p.brand).isPure !== false
+        );
+        if (pureItems.length === 0) continue;
+
+        // Priorizar productos 100% puros (no mezclas) si existen en esa tienda
+        const nonBlend = pureItems.filter((p) => !p.isBlend);
+        const preferredPool = nonBlend.length > 0 ? nonBlend : pureItems;
+
         // Filtrar por la misma unidad (kg o lt) para comparar justamente $/kg o $/L
-        const unitMatched = storeItems.filter((p) => p.unit === targetUnit);
-        const candidates = unitMatched.length > 0 ? unitMatched : storeItems;
+        const unitMatched = preferredPool.filter((p) => p.unit === targetUnit);
+        const candidates = unitMatched.length > 0 ? unitMatched : preferredPool;
 
         // Elegir el más económico por unidad ($/kg, $/L, $/un)
         candidates.sort((a, b) => a.unitPrice - b.unitPrice);
