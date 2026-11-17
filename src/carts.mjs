@@ -4,6 +4,7 @@ import {
   getTodayDayIndex,
   getWeekdayName,
 } from "./discounts.mjs";
+import { extractQuantityFromText } from "./normalizer.mjs";
 import { searchAllStores, STORES } from "./scrapers.mjs";
 
 const ALL_STORES = ["jumbo", "santaisabel", "unimarc", "tottus", "lider"];
@@ -55,6 +56,47 @@ function detectDominantUnit(products, preferredUnit) {
   return "un";
 }
 
+function toCartCandidate(p, storeOverride = null) {
+  const store = storeOverride || p.store;
+  const spec = extractQuantityFromText(p.name, p.formatLabel);
+  return {
+    externalId: String(p.externalId || p.sku),
+    sku: String(p.sku || p.externalId),
+    store,
+    name: p.name,
+    brand: p.brand || "",
+    price: p.price,
+    listPrice: p.listPrice || null,
+    bundlePricePerItem: p.bundlePricePerItem || null,
+    promoText: p.promoText || null,
+    unit: p.unit || "un",
+    unitPrice: p.unitPrice,
+    effectiveUnitPrice: p.effectiveUnitPrice || p.unitPrice,
+    baseAmount: p.baseAmount || spec?.baseAmount || 1,
+    formatLabel: p.formatLabel || `1 ${p.unit || "un"}`,
+    pricePer100: p.pricePer100 || Math.round(p.unitPrice / 10),
+    url: p.url || "",
+    imageUrl: p.imageUrl || "",
+  };
+}
+
+function getCandidateSpec(c) {
+  const spec = extractQuantityFromText(c.name || "", c.formatLabel || "");
+  const fallbackUnit = ["kg", "lt", "un"].includes(c.unit) ? c.unit : "un";
+  const unit = spec?.unit || fallbackUnit;
+  const baseAmount =
+    spec?.baseAmount > 0 ? spec.baseAmount : c.baseAmount > 0 ? c.baseAmount : 1;
+  if (spec?.baseAmount > 0 && c.price > 0) {
+    c.unit = spec.unit;
+    c.baseAmount = spec.baseAmount;
+    c.unitPrice = Math.round(c.price / spec.baseAmount);
+  } else {
+    c.unit = unit;
+    c.baseAmount = baseAmount;
+  }
+  return { unit, baseAmount };
+}
+
 /**
  * Busca candidatos por tienda para un ítem del carrito.
  * Guarda hasta 6 opciones por supermercado para que el usuario pueda
@@ -74,24 +116,7 @@ export async function fetchCandidatesForCartQuery(searchQuery, preferredUnit = "
     const storeProds = res.products.filter((p) => p.store === storeId);
     const unitMatched = storeProds.filter((p) => p.unit === targetUnit);
     const list = (unitMatched.length > 0 ? unitMatched : storeProds).slice(0, 6);
-    candidatesByStore[storeId] = list.map((p) => ({
-      externalId: String(p.externalId || p.sku),
-      sku: String(p.sku || p.externalId),
-      store: p.store,
-      name: p.name,
-      brand: p.brand || "",
-      price: p.price,
-      listPrice: p.listPrice || null,
-      bundlePricePerItem: p.bundlePricePerItem || null,
-      promoText: p.promoText || null,
-      unit: p.unit || "un",
-      unitPrice: p.unitPrice,
-      effectiveUnitPrice: p.effectiveUnitPrice || p.unitPrice,
-      formatLabel: p.formatLabel || `1 ${p.unit || "un"}`,
-      pricePer100: p.pricePer100 || Math.round(p.unitPrice / 10),
-      url: p.url || "",
-      imageUrl: p.imageUrl || "",
-    }));
+    candidatesByStore[storeId] = list.map((p) => toCartCandidate(p));
   }
 
   return { targetUnit, candidatesByStore };
@@ -176,6 +201,37 @@ export function evaluateCart(cartRow) {
     const selectedByStore = parsed.selectedByStore || {};
     const qty = Math.max(1, Number(row.quantity) || 1);
 
+    let refSpec = null;
+    if (candidatesByStore.lider?.[0]) {
+      refSpec = getCandidateSpec(candidatesByStore.lider[0]);
+    } else {
+      const labelSpec = extractQuantityFromText(row.label, "");
+      refSpec = labelSpec || {
+        unit: row.preferred_unit && row.preferred_unit !== "auto" ? row.preferred_unit : "un",
+        baseAmount: 1,
+      };
+    }
+    const targetTotalAmount = qty * refSpec.baseAmount;
+
+    const getScaledQty = (cand) => {
+      const candSpec = getCandidateSpec(cand);
+      if (candSpec.unit === refSpec.unit && refSpec.baseAmount > 0 && candSpec.baseAmount > 0) {
+        const ratio = targetTotalAmount / candSpec.baseAmount;
+        const singleRatio = candSpec.baseAmount / refSpec.baseAmount;
+        if (singleRatio >= 0.65 && singleRatio <= 1.35) return qty;
+        return Math.max(1, Math.round(ratio));
+      }
+      return qty;
+    };
+
+    const getSizeRatio = (cand) => {
+      const candSpec = getCandidateSpec(cand);
+      if (candSpec.unit !== refSpec.unit || refSpec.baseAmount <= 0 || candSpec.baseAmount <= 0) {
+        return 999;
+      }
+      return Math.max(candSpec.baseAmount / refSpec.baseAmount, refSpec.baseAmount / candSpec.baseAmount);
+    };
+
     const storeOffers = {};
 
     for (const storeId of ALL_STORES) {
@@ -184,10 +240,15 @@ export function evaluateCart(cartRow) {
         : [];
       if (candidates.length === 0) continue;
 
-      // Ordenar según el criterio elegido
+      // Ordenar priorizando formatos equivalentes (sizeRatio <= 2.2) y el criterio elegido
       candidates.sort((a, b) => {
+        const closeA = getSizeRatio(a) <= 2.2 ? 0 : 1;
+        const closeB = getSizeRatio(b) <= 2.2 ? 0 : 1;
+        if (closeA !== closeB) return closeA - closeB;
         if (criteria === "total_price") {
-          return a.price - b.price || a.unitPrice - b.unitPrice;
+          const lineA = (a.price || 0) * getScaledQty(a);
+          const lineB = (b.price || 0) * getScaledQty(b);
+          return lineA - lineB || a.unitPrice - b.unitPrice;
         }
         return a.unitPrice - b.unitPrice || a.price - b.price;
       });
@@ -199,7 +260,8 @@ export function evaluateCart(cartRow) {
         candidates[0];
 
       if (chosen) {
-        const pricing = computeLinePricing(chosen, qty);
+        const scaledQty = getScaledQty(chosen);
+        const pricing = computeLinePricing(chosen, scaledQty);
         const cardDiscount = calculateDiscountedPricing({
           store: storeId,
           price: pricing.unitPackagePrice,
@@ -208,13 +270,15 @@ export function evaluateCart(cartRow) {
           dayOfWeek,
         });
 
-        const discountedLineTotal = cardDiscount.finalPrice * qty;
+        const discountedLineTotal = cardDiscount.finalPrice * scaledQty;
 
         storeOffers[storeId] = {
           store: storeId,
           product: chosen,
           isManualSelection: Boolean(manualSku),
           ...pricing,
+          baseQty: qty,
+          isScaledQty: scaledQty !== qty,
           cardDiscount,
           discountedLineTotal,
           candidates,
@@ -410,7 +474,7 @@ export function evaluateCart(cartRow) {
     }
   }
 
-  // 3. Mejor Combinación de Máximo 2 Supermercados
+  // 3. Mejor Combinación de Máximo 2 Supermercados (incluyendo costo de despacho por tienda)
   let bestTwoCombo = null;
   const activeStoreIds = singleStoreRanking.map((s) => s.store);
   for (let i = 0; i < activeStoreIds.length; i++) {
@@ -418,6 +482,8 @@ export function evaluateCart(cartRow) {
       const sA = activeStoreIds[i];
       const sB = activeStoreIds[j];
       let pairTotal = 0;
+      let subA = 0;
+      let subB = 0;
       let pairFound = 0;
       for (const item of items) {
         const oA = item.storeOffers[sA];
@@ -425,20 +491,38 @@ export function evaluateCart(cartRow) {
         if (!oA && !oB) continue;
         pairFound++;
         if (oA && oB) {
-          pairTotal += Math.min(oA.lineTotal, oB.lineTotal);
+          if (oA.lineTotal <= oB.lineTotal) {
+            subA += oA.lineTotal;
+            pairTotal += oA.lineTotal;
+          } else {
+            subB += oB.lineTotal;
+            pairTotal += oB.lineTotal;
+          }
+        } else if (oA) {
+          subA += oA.lineTotal;
+          pairTotal += oA.lineTotal;
         } else {
-          pairTotal += (oA || oB).lineTotal;
+          subB += oB.lineTotal;
+          pairTotal += oB.lineTotal;
         }
       }
+      const feeA =
+        enableFriction && subA > 0 && subA < freeDeliveryThreshold ? deliveryCost : 0;
+      const feeB =
+        enableFriction && subB > 0 && subB < freeDeliveryThreshold ? deliveryCost : 0;
+      const deliveryFeesClp = feeA + feeB;
+      const netPairTotal = pairTotal + deliveryFeesClp;
       if (
         !bestTwoCombo ||
         pairFound > bestTwoCombo.foundCount ||
-        (pairFound === bestTwoCombo.foundCount && pairTotal < bestTwoCombo.totalClp)
+        (pairFound === bestTwoCombo.foundCount && netPairTotal < bestTwoCombo.netTotalClp)
       ) {
         bestTwoCombo = {
           stores: [sA, sB],
           storeNames: `${STORES[sA]?.name} + ${STORES[sB]?.name}`,
           totalClp: pairTotal,
+          deliveryFeesClp,
+          netTotalClp: netPairTotal,
           foundCount: pairFound,
         };
       }
@@ -561,24 +645,7 @@ export async function addCartItem(
       (c) => String(c.externalId) === String(initialProduct.externalId)
     );
     if (!exists) {
-      candidatesByStore[st].unshift({
-        externalId: String(initialProduct.externalId || initialProduct.sku),
-        sku: String(initialProduct.sku || initialProduct.externalId),
-        store: st,
-        name: initialProduct.name,
-        brand: initialProduct.brand || "",
-        price: initialProduct.price,
-        listPrice: initialProduct.listPrice || null,
-        bundlePricePerItem: initialProduct.bundlePricePerItem || null,
-        promoText: initialProduct.promoText || null,
-        unit: initialProduct.unit || "un",
-        unitPrice: initialProduct.unitPrice,
-        effectiveUnitPrice: initialProduct.effectiveUnitPrice || initialProduct.unitPrice,
-        formatLabel: initialProduct.formatLabel || `1 ${initialProduct.unit || "un"}`,
-        pricePer100: initialProduct.pricePer100 || Math.round(initialProduct.unitPrice / 10),
-        url: initialProduct.url || "",
-        imageUrl: initialProduct.imageUrl || "",
-      });
+      candidatesByStore[st].unshift(toCartCandidate(initialProduct, st));
     }
     selectedByStore[st] = String(initialProduct.externalId || initialProduct.sku);
   }
@@ -677,6 +744,10 @@ export async function refreshCartPrices(cartId) {
       item.search_query,
       item.preferred_unit
     );
+    const existingLider = parsed.candidatesByStore?.lider;
+    if (existingLider?.length && !candidatesByStore.lider?.length) {
+      candidatesByStore.lider = existingLider;
+    }
     parsed.candidatesByStore = candidatesByStore;
     db.prepare("UPDATE cart_items SET options_json = ? WHERE id = ?").run(
       JSON.stringify(parsed),

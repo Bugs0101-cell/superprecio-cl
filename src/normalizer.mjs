@@ -29,10 +29,12 @@ export function parseClpString(value) {
 
 export function normalizeUnit(rawUnit) {
   const u = normalizeText(rawUnit).replace(/\./g, "");
-  if (["g", "gr", "grs", "gramo", "gramos", "kg", "kilo", "kilos", "k"].includes(u)) {
+  if (
+    ["g", "gr", "grs", "gramo", "gramos", "kg", "kilo", "kilos", "k", "10gr", "10g", "100gr", "100g"].includes(u)
+  ) {
     return "kg";
   }
-  if (["ml", "cc", "cm3", "lt", "l", "lts", "litro", "litros"].includes(u)) {
+  if (["ml", "cc", "cm3", "lt", "l", "lts", "litro", "litros", "100ml", "100cc"].includes(u)) {
     return "lt";
   }
   if (
@@ -52,6 +54,11 @@ export function normalizeUnit(rawUnit) {
       "panales",
       "hoja",
       "hojas",
+      "m",
+      "mt",
+      "mts",
+      "metro",
+      "metros",
     ].includes(u)
   ) {
     return "un";
@@ -208,28 +215,16 @@ export function enrichUnitMetrics({
     if (!baseAmount) baseAmount = storeMultiplier;
   }
 
-  // Si pudimos extraer peso/volumen del título (ej. "900 g", "1.5 L") y el supermercado
-  // reportó unidad "un" o no reportó precio por unidad, priorizamos la medida física (kg/lt)
-  if (extracted && (extracted.unit === "kg" || extracted.unit === "lt")) {
-    const computedFromText = Math.round(price / extracted.baseAmount);
-    if (!unitPrice || !unit || unit === "un") {
-      unit = extracted.unit;
-      unitPrice = computedFromText;
-      baseAmount = extracted.baseAmount;
-    } else if (unit === extracted.unit) {
-      // Si el supermercado reportó $/100g sin etiquetarlo y difiere por factor ~10
-      const ratio = computedFromText / unitPrice;
-      if (ratio > 8 && ratio < 12) {
-        unitPrice = computedFromText;
-      }
-    }
-  }
-
-  // Fallback si aún no hay unitPrice pero tenemos extracted (ej. "30 un")
-  if (!unitPrice && extracted && extracted.baseAmount > 0) {
+  // Si pudimos extraer peso/volumen del título (ej. "900 g", "1.5 L"), siempre normalizamos
+  // a kg/lt para evitar errores cuando la tienda reporta "10gr", "100g" o "un"
+  if (extracted && (extracted.unit === "kg" || extracted.unit === "lt") && extracted.baseAmount > 0) {
     unit = extracted.unit;
-    unitPrice = Math.round(price / extracted.baseAmount);
     baseAmount = extracted.baseAmount;
+    unitPrice = Math.round(price / extracted.baseAmount);
+  } else if (extracted && extracted.unit === "un" && extracted.baseAmount > 0) {
+    unit = "un";
+    baseAmount = extracted.baseAmount;
+    unitPrice = Math.round(price / extracted.baseAmount);
   }
 
   // Fallback final: 1 unidad
