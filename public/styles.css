@@ -1572,3 +1572,33 @@ textarea {
   border-color: #3b82f6;
   background: rgba(59, 130, 246, 0.12);
 }
+
+/* --- Badges de Verificación de Links (200 OK / 404 Caído / Antibot) --- */
+.link-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  font-size: 0.67rem;
+  font-weight: 700;
+  padding: 0.1rem 0.42rem;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+
+.link-badge.link-ok {
+  background: rgba(16, 185, 129, 0.16);
+  color: #34d399;
+  border: 1px solid rgba(16, 185, 129, 0.4);
+}
+
+.link-badge.link-broken {
+  background: rgba(239, 68, 68, 0.22);
+  color: #fca5a5;
+  border: 1px solid rgba(239, 68, 68, 0.6);
+}
+
+.link-badge.link-protected {
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}

@@ -16,8 +16,9 @@ let state = {
   selectedHistoryItemId: null,
   chartMode: "unit", // 'unit' | 'total'
   unitScale: "base", // 'base' ($/kg, $/lt) | 'per100' ($/100g, $/100ml) | 'small' ($/g, $/ml) | 'protein' ($/10g prot)
-  cardSortByItemId: {}, // { [itemId]: 'unit' | 'protein' | 'nutrition' }
+  cardSortByItemId: {}, // { [itemId]: 'unit' | 'effective' | 'package' | 'protein' | 'nutrition' }
   selectedSearchBrand: "all",
+  linkChecksByUrl: {}, // { [url]: { ok, status, httpStatus, url } }
   liveSearchResults: [],
   liveSearchPackTraps: [],
   liveSearchQuery: "",
@@ -94,6 +95,86 @@ function getActiveCart() {
   );
 }
 
+function getLinkCheckInfo(url, fallbackStatus = null) {
+  const checked = url ? state.linkChecksByUrl[url] : null;
+  if (checked) return checked;
+  if (fallbackStatus && fallbackStatus !== "unknown") {
+    return { status: fallbackStatus, ok: fallbackStatus !== "broken" };
+  }
+  return null;
+}
+
+function renderLinkBadge(url, fallbackStatus = null) {
+  const info = getLinkCheckInfo(url, fallbackStatus);
+  if (!info || !url || url === "#") return "";
+  if (info.status === "broken") {
+    return `<span class="link-badge link-broken" title="El supermercado devolvió 404 Not Found o página inexistente">🚫 404 Caído</span>`;
+  }
+  if (info.status === "ok") {
+    return `<span class="link-badge link-ok" title="Link verificado HTTP 200 OK en el supermercado">🟢 200 OK</span>`;
+  }
+  if (info.status === "protected") {
+    return `<span class="link-badge link-protected" title="Validado vía API oficial (la web bloquea bots HTTP directos del servidor)">🛡️ Vía API</span>`;
+  }
+  return "";
+}
+
+async function verifyVisibleLinks({ forceAll = false, showToastFeedback = false } = {}) {
+  const entries = [];
+  const seen = new Set();
+  const pushEntry = (store, url) => {
+    if (!url || url === "#" || !/^https?:\/\//i.test(url)) return;
+    if (!forceAll && state.linkChecksByUrl[url]) return;
+    if (seen.has(url)) return;
+    seen.add(url);
+    entries.push({ key: url, store, url });
+  };
+
+  for (const item of state.trackedItems || []) {
+    for (const [st, snap] of Object.entries(item.latestByStore || {})) {
+      pushEntry(st, snap.product_url);
+    }
+  }
+  const cart = getActiveCart();
+  for (const item of cart?.items || []) {
+    for (const [st, offer] of Object.entries(item.storeOffers || {})) {
+      pushEntry(st, offer?.product?.url);
+    }
+  }
+
+  if (entries.length === 0) {
+    if (showToastFeedback) showToast("Todos los links visibles ya fueron verificados.");
+    return;
+  }
+
+  try {
+    const res = await fetch("/api/verify-links", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ links: entries.slice(0, 60) }),
+    });
+    const data = await res.json();
+    if (data.results) {
+      Object.assign(state.linkChecksByUrl, data.results);
+      renderTrackedCards();
+      renderHistorySection();
+      renderBasketComparison();
+      if (showToastFeedback) {
+        const vals = Object.values(data.results);
+        const brokenCount = vals.filter((v) => v.status === "broken").length;
+        const okCount = vals.filter((v) => v.status === "ok").length;
+        showToast(
+          brokenCount > 0
+            ? `Links verificados: ${okCount} OK · ${brokenCount} con error 404 detectado.`
+            : `Links verificados: ${vals.length} revisados (${okCount} 200 OK).`
+        );
+      }
+    }
+  } catch (err) {
+    if (showToastFeedback) showToast("Error verificando links: " + err.message);
+  }
+}
+
 // --- Carga de Datos desde el Backend ---
 
 async function loadTrackedData() {
@@ -131,6 +212,7 @@ async function loadTrackedData() {
     }
 
     renderAll();
+    verifyVisibleLinks({ forceAll: false, showToastFeedback: false });
   } catch (err) {
     console.error("Error al cargar datos principales:", err);
   }
@@ -240,7 +322,11 @@ function renderTrackedCards() {
         (state.unitScale === "protein" ? "protein" : "unit");
 
       const best =
-        cardMode === "protein"
+        cardMode === "effective"
+          ? item.bestByEffectiveUnitPrice || item.bestByUnitPrice
+          : cardMode === "package"
+          ? item.bestByPackagePrice || item.bestByTotalPrice
+          : cardMode === "protein"
           ? item.bestByProteinPrice || item.bestByUnitPrice
           : cardMode === "nutrition"
           ? item.bestByNutritionScore || item.bestByUnitPrice
@@ -256,6 +342,8 @@ function renderTrackedCards() {
         const isWinner = best && best.store === storeId;
         const vStat = varMap[storeId];
         const deltaPct = vStat?.deltaPrevPct ?? 0;
+        const linkInfo = getLinkCheckInfo(snap.product_url);
+        const isBrokenLink = linkInfo?.status === "broken";
 
         let deltaBadge = `<span class="delta-pill delta-same">= 0%</span>`;
         if (deltaPct < 0) {
@@ -288,19 +376,52 @@ function renderTrackedCards() {
           ? `<span class="purity-warning-pill ${snap.is_pure === false ? "is-impure" : "is-blend"}">${snap.purity_warning}</span>`
           : "";
 
+        const uShort = snap.unit === "lt" ? "L" : snap.unit === "kg" ? "kg" : snap.unit;
+        const hasEffPromo =
+          snap.promo_unit_price &&
+          snap.effective_unit_price &&
+          snap.effective_unit_price < snap.unit_price;
+
+        const mainPriceHtml =
+          cardMode === "protein" && snap.protein_price
+            ? `${fmtClp(snap.protein_price)} / 10g prot`
+            : cardMode === "nutrition" && snap.nutrition_score
+            ? `Score ${snap.nutrition_score}/100 (${snap.nutrition_grade || ""})`
+            : cardMode === "package"
+            ? hasEffPromo
+              ? `<span class="crossed-price" style="font-size:0.78rem;">${fmtClp(snap.price)}</span> ${fmtClp(snap.promo_unit_price)} / un`
+              : `${fmtClp(snap.price)} / un`
+            : cardMode === "effective" && hasEffPromo
+            ? `<span class="crossed-price" style="font-size:0.78rem;">${fmtClp(snap.unit_price)}</span> ${fmtClp(snap.effective_unit_price)} / ${uShort}`
+            : fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price);
+
+        const packagePromoLine = hasEffPromo
+          ? `Envase: <span class="crossed-price">${fmtClp(snap.price)}</span> <strong style="color:#fbbf24;">${fmtClp(snap.promo_unit_price)} / un</strong>`
+          : `Envase/un: <strong>${fmtClp(snap.price)}</strong>`;
+
+        const kgRefLine =
+          cardMode === "package"
+            ? `<span>· ${fmtClp(hasEffPromo ? snap.effective_unit_price : snap.unit_price)}/${uShort}</span>`
+            : hasEffPromo && cardMode !== "effective"
+            ? `<div style="font-size:0.71rem; color:#fbbf24; font-weight:700;">🏷️ c/ promo: ${fmtClp(snap.effective_unit_price)}/${uShort} (${fmtClp(snap.promo_unit_price)}/un)</div>`
+            : "";
+
         return `
-          <div class="store-row ${isWinner ? "is-cheapest" : ""} ${snap.is_pure === false ? "is-impure-row" : ""}">
+          <div class="store-row ${isWinner ? "is-cheapest" : ""} ${snap.is_pure === false || isBrokenLink ? "is-impure-row" : ""}">
             <div>
               <span class="store-badge store-${storeId}">${STORE_META[storeId]?.name || storeId}</span>
             </div>
             <div class="store-row-prod">
-              <a href="${snap.product_url || "#"}" target="_blank" rel="noopener" title="${snap.product_name}">
-                ${isWinner ? "🏆 " : ""}${snap.product_name}
-              </a>
+              <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;">
+                <a href="${snap.product_url || "#"}" target="_blank" rel="noopener" title="${snap.product_name}">
+                  ${isWinner ? "🏆 " : ""}${snap.product_name}
+                </a>
+                ${renderLinkBadge(snap.product_url, snap.link_status)}
+              </div>
               <div class="store-row-meta">
                 ${snap.brand ? `<span class="brand-mini-pill">🏷️ ${snap.brand}</span>` : ""}
                 <span>📦 ${snap.format_label || `1 ${snap.unit}`}</span>
-                ${snap.promo_text ? `<span style="color:#fbbf24;">🏷️ ${snap.promo_text}</span>` : ""}
+                ${snap.promo_text ? `<span style="color:#fbbf24; font-weight:700;">🏷️ ${snap.promo_text}</span>` : ""}
                 ${purityTag}
                 ${nutritionTag}
                 ${proteinTag}
@@ -310,17 +431,11 @@ function renderTrackedCards() {
             </div>
             <div class="store-row-prices">
               <div class="unit-price-main">
-                ${
-                  cardMode === "protein" && snap.protein_price
-                    ? `${fmtClp(snap.protein_price)} / 10g prot`
-                    : cardMode === "nutrition" && snap.nutrition_score
-                    ? `Score ${snap.nutrition_score}/100 (${snap.nutrition_grade || ""})`
-                    : fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price)
-                }
+                ${mainPriceHtml}
               </div>
+              ${kgRefLine}
               <div class="total-price-sub">
-                Total: <strong>${fmtClp(snap.price)}</strong>
-                ${cardMode !== "unit" ? `· <span>${fmtClp(snap.unit_price)}/${snap.unit === "lt" ? "L" : snap.unit}</span>` : ""}
+                ${packagePromoLine}
                 ${snap.list_price ? `<span class="crossed-price">${fmtClp(snap.list_price)}</span>` : ""}
                 ${deltaBadge}
               </div>
@@ -331,15 +446,24 @@ function renderTrackedCards() {
         .filter(Boolean)
         .join("");
 
+      const bestUShort = best?.unit === "lt" ? "L" : best?.unit === "kg" ? "kg" : best?.unit || "un";
       const winnerTitle =
-        cardMode === "protein" && best?.protein_price
+        cardMode === "effective"
+          ? "🏷️ Mejor $/Unidad (c/ Promo):"
+          : cardMode === "package"
+          ? "📦 Mejor $/Envase (un.):"
+          : cardMode === "protein" && best?.protein_price
           ? "🥩 Mejor $/10g Proteína:"
           : cardMode === "nutrition" && best?.nutrition_score
           ? "🧬 Mejor Calidad Nutricional:"
           : "🏆 Mejor $/Unidad:";
 
       const winnerMetric =
-        cardMode === "protein" && best?.protein_price
+        cardMode === "effective" && best
+          ? `${fmtClp(best.effective_unit_price || best.unit_price)} / ${bestUShort}`
+          : cardMode === "package" && best
+          ? `${fmtClp(best.package_unit_price || best.price)} / un`
+          : cardMode === "protein" && best?.protein_price
           ? `${fmtClp(best.protein_price)} / 10g prot`
           : cardMode === "nutrition" && best?.nutrition_score
           ? `${best.nutrition_grade || ""} (${best.nutrition_score}/100)`
@@ -353,7 +477,7 @@ function renderTrackedCards() {
             <div class="winner-banner-left">
               <span>${winnerTitle} <strong>${STORE_META[best.store]?.name}</strong></span>
               <span class="winner-price-big">${winnerMetric}</span>
-              <span class="small-muted">(${fmtClp(best.price)} · ${best.format_label || "1 " + best.unit}${cardMode !== "unit" ? ` · ${fmtClp(best.unit_price)}/${best.unit === "lt" ? "L" : best.unit}` : ""})</span>
+              <span class="small-muted">(${fmtClp(best.promo_unit_price || best.price)} c/u · ${best.format_label || "1 " + best.unit}${cardMode !== "unit" && cardMode !== "effective" ? ` · ${fmtClp(best.effective_unit_price || best.unit_price)}/${bestUShort}` : ""})</span>
             </div>
             ${
               item.maxSavingsPct > 0
@@ -389,7 +513,9 @@ function renderTrackedCards() {
                 ${pinnedCount > 0 ? ` · 📌 ${pinnedCount} fijado(s)` : ""}
               </div>
               <div class="card-mode-pills">
-                <button type="button" class="card-mode-pill ${cardMode === "unit" ? "active" : ""}" data-item-id="${item.id}" data-mode="unit">💲 $/Unidad</button>
+                <button type="button" class="card-mode-pill ${cardMode === "unit" ? "active" : ""}" data-item-id="${item.id}" data-mode="unit">💲 $/kg·L</button>
+                <button type="button" class="card-mode-pill ${cardMode === "effective" ? "active" : ""}" data-item-id="${item.id}" data-mode="effective">🏷️ c/ Promo 2x</button>
+                <button type="button" class="card-mode-pill ${cardMode === "package" ? "active" : ""}" data-item-id="${item.id}" data-mode="package">📦 $/Envase (un.)</button>
                 <button type="button" class="card-mode-pill ${cardMode === "protein" ? "active" : ""}" data-item-id="${item.id}" data-mode="protein">🥩 $/10g Prot</button>
                 <button type="button" class="card-mode-pill ${cardMode === "nutrition" ? "active" : ""}" data-item-id="${item.id}" data-mode="nutrition">🧬 Nutrición</button>
               </div>
@@ -635,16 +761,28 @@ function renderHistorySection() {
       if (!st || !snap) return "";
 
       const dPrev = st.deltaPrevPct;
+      const uShort = snap.unit === "lt" ? "L" : snap.unit;
+      const hasPromoUnit =
+        snap.promo_unit_price && snap.effective_unit_price && snap.effective_unit_price < snap.unit_price;
+      const linkBadge = renderLinkBadge(snap.product_url) || `<span class="small-muted">—</span>`;
 
       return `
         <tr>
           <td><span class="store-badge store-${storeId}">${STORE_META[storeId]?.name}</span></td>
+          <td>${linkBadge}</td>
           <td>
             <span class="signal-pill signal-${st.signal || "normal"}" title="${st.signalExplanation || ""}">
               ${st.signalLabel || "🟡 Habitual"}
             </span>
           </td>
-          <td><strong>${fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price)}</strong> <span class="small-muted">(${fmtClp(snap.price)})</span></td>
+          <td>
+            <strong>${fmtUnitScaled(snap.unit_price, snap.unit, state.unitScale, snap.protein_price)}</strong>
+            ${hasPromoUnit ? `<div style="font-size:0.72rem; color:#fbbf24; font-weight:700;">🏷️ c/ promo: ${fmtClp(snap.effective_unit_price)} / ${uShort}</div>` : ""}
+          </td>
+          <td>
+            <strong>${fmtClp(snap.price)}</strong> / un
+            ${hasPromoUnit ? `<div style="font-size:0.72rem; color:#fbbf24; font-weight:700;">🏷️ ${snap.promo_text}: ${fmtClp(snap.promo_unit_price)} / un</div>` : ""}
+          </td>
           <td>${fmtUnitScaled(st.minUnitPrice, snap.unit, state.unitScale)}</td>
           <td>${fmtUnitScaled(st.maxUnitPrice, snap.unit, state.unitScale)}</td>
           <td>${fmtUnitScaled(st.avgUnitPrice, snap.unit, state.unitScale)}</td>
@@ -669,20 +807,29 @@ function renderHistorySection() {
     const reversedHistory = [...history].reverse();
     tbodySnaps.innerHTML = reversedHistory
       .slice(0, 60)
-      .map(
-        (s) => `
+      .map((s) => {
+        const uShort = s.unit === "lt" ? "L" : s.unit;
+        const hasPromo = s.promo_unit_price && s.effective_unit_price && s.effective_unit_price < s.unit_price;
+        return `
         <tr>
           <td>${fmtDateShort(s.recorded_at)}</td>
           <td><span class="store-badge store-${s.store}">${STORE_META[s.store]?.name || s.store}</span></td>
+          <td>${renderLinkBadge(s.product_url) || `<span class="small-muted">—</span>`}</td>
           <td><a href="${s.product_url || "#"}" target="_blank" rel="noopener" style="color:#f1f5f9;">${s.product_name}</a></td>
           <td>${s.format_label || `1 ${s.unit}`}</td>
-          <td><strong>${fmtClp(s.price)}</strong></td>
-          <td style="color:#34d399; font-weight:700;">${fmtClp(s.unit_price)} / ${s.unit === "lt" ? "L" : s.unit}</td>
+          <td>
+            <strong>${fmtClp(s.price)}</strong> / un
+            ${hasPromo ? `<div style="font-size:0.72rem; color:#fbbf24; font-weight:700;">🏷️ ${fmtClp(s.promo_unit_price)} / un</div>` : ""}
+          </td>
+          <td style="color:#34d399; font-weight:700;">
+            ${fmtClp(s.unit_price)} / ${uShort}
+            ${hasPromo ? `<div style="font-size:0.72rem; color:#fbbf24;">🏷️ ${fmtClp(s.effective_unit_price)} / ${uShort}</div>` : ""}
+          </td>
           <td>${fmtClp(s.price_per_100)} / ${s.unit === "kg" ? "100g" : s.unit === "lt" ? "100ml" : "un"}</td>
           <td>${s.promo_text || "—"}</td>
         </tr>
-      `
-      )
+      `;
+      })
       .join("");
   }
 }
@@ -987,17 +1134,21 @@ function renderBasketComparison() {
                 }
               </div>
               <div style="font-size:0.78rem; font-weight:600; color:#94a3b8;">
-                ${fmtUnitScaled(p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)} · 📦 ${p.formatLabel}
+                ${fmtUnitScaled(p.effectiveUnitPrice || p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)} · 📦 ${p.formatLabel}
+              </div>
+              <div style="font-size:0.75rem; color:#e2e8f0;">
+                Envase: <strong>${fmtClp(p.price)}</strong>/un${p.bundlePricePerItem && p.bundlePricePerItem < p.price ? ` · <span style="color:#fbbf24; font-weight:700;">🏷️ ${fmtClp(p.bundlePricePerItem)}/un</span>` : ""}
               </div>
               ${
                 p.brand
                   ? `<div style="font-size:0.72rem; color:#93c5fd; font-weight:600;">🏷️ ${p.brand}</div>`
                   : ""
               }
-              <div style="margin-top:0.2rem;">
+              <div style="margin-top:0.2rem; display:flex; align-items:center; gap:0.35rem; flex-wrap:wrap;">
                 <a href="${p.url || "#"}" target="_blank" rel="noopener" style="color:#cbd5e1; font-size:0.76rem; text-decoration:none;">
                   ${p.name.slice(0, 42)}
                 </a>
+                ${renderLinkBadge(p.url, p.linkStatus)}
               </div>
               ${
                 p.pricePer10gProtein
@@ -1253,7 +1404,10 @@ function renderSearchProductCard(p, idx, bestUnitPrice) {
     <div class="product-card ${isBest ? "best-unit-deal" : ""} ${p.isPure === false ? "is-impure-card" : ""}">
       <div>
         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.55rem;">
-          <span class="store-badge store-${p.store}">${p.storeName}</span>
+          <div style="display:flex; align-items:center; gap:0.35rem;">
+            <span class="store-badge store-${p.store}">${p.storeName}</span>
+            ${renderLinkBadge(p.url, p.linkStatus)}
+          </div>
           ${isBest ? `<span class="best-deal-ribbon">🏆 MEJOR $/UNIDAD</span>` : ""}
           ${!isBest && discountPct > 0 ? `<span class="savings-badge">-${discountPct}%</span>` : ""}
         </div>
@@ -1306,11 +1460,16 @@ function renderSearchProductCard(p, idx, bestUnitPrice) {
 
         <div style="display:flex; justify-content:space-between; align-items:center; margin-top:0.65rem; gap:0.4rem;">
           <div>
-            <div class="small-muted">Precio envase:</div>
+            <div class="small-muted">Precio envase / unidad:</div>
             <div style="font-size:1.05rem; font-weight:800;">
-              ${fmtClp(p.price)}
+              ${fmtClp(p.price)} / un
               ${p.listPrice ? `<span class="crossed-price" style="font-size:0.8rem;">${fmtClp(p.listPrice)}</span>` : ""}
             </div>
+            ${
+              p.bundlePricePerItem && p.bundlePricePerItem < p.price
+                ? `<div style="font-size:0.74rem; color:#fbbf24; font-weight:700;">🏷️ ${p.promoText || "Promo"}: ${fmtClp(p.bundlePricePerItem)} / un</div>`
+                : ""
+            }
           </div>
 
           <div style="display:flex; gap:0.35rem;">
@@ -2357,6 +2516,19 @@ window.addEventListener("DOMContentLoaded", () => {
     } finally {
       btn.disabled = false;
       btn.textContent = "🔔 Probar Alerta en mi Celular";
+    }
+  });
+
+  // Botón Verificar Links en vivo
+  document.getElementById("btnVerifyTrackedLinks")?.addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    btn.textContent = "⏳ Verificando...";
+    try {
+      await verifyVisibleLinks({ forceAll: true, showToastFeedback: true });
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🔗 Verificar Links";
     }
   });
 

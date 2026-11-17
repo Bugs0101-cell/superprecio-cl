@@ -108,9 +108,14 @@
           <h2>Productos en Seguimiento Automático y Semáforo de Precios</h2>
           <p>Compara en tiempo real qué supermercado tiene el menor precio por unidad (kg, L, 10g proteína), detecta <strong>Pisos Históricos (🟢)</strong>, <strong>Ofertas Infladas (🔴)</strong> y cambios de gramaje (Reduflación).</p>
         </div>
-        <button id="btnOpenNewTrackModal" class="btn btn-accent">
-          ➕ Nuevo Producto a Seguir
-        </button>
+        <div style="display:flex; gap:0.55rem; flex-wrap:wrap;">
+          <button id="btnVerifyTrackedLinks" class="btn btn-secondary" title="Comprobar si todos los links responden 200 OK o tienen 404">
+            🔗 Verificar Links
+          </button>
+          <button id="btnOpenNewTrackModal" class="btn btn-accent">
+            ➕ Nuevo Producto a Seguir
+          </button>
+        </div>
       </div>
 
       <!-- Tarjetas de Productos Seguidos -->
@@ -152,8 +157,10 @@
                 <thead>
                   <tr>
                     <th>Supermercado</th>
+                    <th>Estado Link</th>
                     <th>Semáforo "¿Compro hoy?"</th>
-                    <th>Precio Actual / Unidad</th>
+                    <th>Precio $/kg · $/L (Comparativo)</th>
+                    <th>Precio $/Envase · Unidad (c/ Promo)</th>
                     <th>Mínimo Histórico</th>
                     <th>Máximo Histórico</th>
                     <th>Promedio</th>
@@ -175,10 +182,11 @@
                 <tr>
                   <th>Fecha y Hora</th>
                   <th>Supermercado</th>
+                  <th>Link</th>
                   <th>Producto</th>
                   <th>Formato</th>
-                  <th>Precio Total</th>
-                  <th>Precio / Unidad</th>
+                  <th>Precio $/Envase (un. / Promo)</th>
+                  <th>Precio $/kg · $/L (Base y Promo)</th>
                   <th>$/100g o 100ml</th>
                   <th>Oferta / Promo</th>
                 </tr>
@@ -211,8 +219,9 @@
           <div class="filter-group">
             <label for="cartCriteriaSelect">Criterio:</label>
             <select id="cartCriteriaSelect">
-              <option value="unit_price">🏆 Mejor $/Unidad (kg, L)</option>
-              <option value="total_price">💰 Envase Más Barato ($)</option>
+              <option value="unit_price">🏆 Mejor $/kg · $/L (Comparativo)</option>
+              <option value="effective_unit_price">🏷️ Mejor $/kg · $/L c/ Promos (2x/5x)</option>
+              <option value="total_price">📦 Envase Más Barato ($/un)</option>
               <option value="protein_price">🥩 Mejor $/10g Proteína</option>
               <option value="nutrition_score">🧬 Mejor Calidad Nutricional</option>
             </select>
