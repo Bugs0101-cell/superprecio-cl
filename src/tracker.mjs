@@ -2,9 +2,9 @@ import {
   createTrackedItem,
   getSetting,
   getTrackedItemById,
-  insertSnapshot,
   listTrackedItems,
   setSetting,
+  touchOrInsertSnapshot,
 } from "./db.mjs";
 import {
   buildCrossStoreSearchQuery,
@@ -43,6 +43,7 @@ export async function refreshTrackedItem(trackedItemId) {
 
   const now = new Date().toISOString();
   const coveredStores = new Set();
+  const newlyInsertedStores = new Set();
   const savedSnapshots = [];
 
   // 1. Actualizar primero los productos fijados específicos (pinnedProducts)
@@ -64,12 +65,13 @@ export async function refreshTrackedItem(trackedItemId) {
         ) || res.products[0];
 
       if (match) {
-        insertSnapshot({
+        const snapRes = touchOrInsertSnapshot({
           trackedItemId: item.id,
           pinnedProductId: pinned.id,
           product: match,
           recordedAt: now,
         });
+        if (snapRes?.inserted) newlyInsertedStores.add(pinned.store);
         coveredStores.add(pinned.store);
         savedSnapshots.push(match);
       }
@@ -133,12 +135,13 @@ export async function refreshTrackedItem(trackedItemId) {
         const best = candidates[0];
 
         if (best) {
-          insertSnapshot({
+          const snapRes = touchOrInsertSnapshot({
             trackedItemId: item.id,
             pinnedProductId: null,
             product: best,
             recordedAt: now,
           });
+          if (snapRes?.inserted) newlyInsertedStores.add(storeId);
           savedSnapshots.push(best);
         }
       }
@@ -147,31 +150,44 @@ export async function refreshTrackedItem(trackedItemId) {
 
   const updatedItem = getTrackedItemById(item.id);
 
-  // Comprobar alertas de Telegram si está habilitado
+  // Comprobar alertas de Telegram si está habilitado (solo ante cambios nuevos)
   try {
     const telegramEnabled = getSetting("telegram_enabled") === "1";
     const token = getSetting("telegram_token");
     const chatId = getSetting("telegram_chat_id");
     const thresholdPct = Number(getSetting("telegram_threshold_pct", "12"));
 
-    if (telegramEnabled && token && chatId && updatedItem) {
+    if (telegramEnabled && token && chatId && updatedItem && newlyInsertedStores.size > 0) {
+      const targetPrice = Number(updatedItem.target_price_clp || 0);
       for (const [storeId, vStat] of Object.entries(updatedItem.variabilityByStore || {})) {
-        if (vStat && vStat.deltaPrevPct <= -thresholdPct) {
-          const latestSnap = updatedItem.latestByStore?.[storeId];
-          if (latestSnap) {
-            const oldPrice = Math.round(latestSnap.price / (1 + vStat.deltaPrevPct / 100));
-            const msg = formatPriceAlertMessage({
-              item: updatedItem,
-              storeName: STORES[storeId]?.name || storeId,
-              oldPrice,
-              newPrice: latestSnap.price,
-              unitPrice: latestSnap.unit_price,
-              unit: latestSnap.unit,
-              savingsPct: Math.abs(Math.round(vStat.deltaPrevPct)),
-              productUrl: latestSnap.product_url,
-            });
-            sendTelegramNotification({ token, chatId, text: msg }).catch(() => {});
+        if (!newlyInsertedStores.has(storeId)) continue;
+        const latestSnap = updatedItem.latestByStore?.[storeId];
+        if (!latestSnap) continue;
+
+        const isPctDrop = vStat && vStat.deltaPrevPct <= -thresholdPct;
+        const isTargetHit =
+          targetPrice > 0 &&
+          (latestSnap.price <= targetPrice || latestSnap.unit_price <= targetPrice);
+
+        if (isPctDrop || isTargetHit) {
+          const oldPrice =
+            vStat && vStat.deltaPrevPct < 0
+              ? Math.round(latestSnap.price / (1 + vStat.deltaPrevPct / 100))
+              : latestSnap.price;
+          let msg = formatPriceAlertMessage({
+            item: updatedItem,
+            storeName: STORES[storeId]?.name || storeId,
+            oldPrice,
+            newPrice: latestSnap.price,
+            unitPrice: latestSnap.unit_price,
+            unit: latestSnap.unit,
+            savingsPct: Math.max(0, Math.abs(Math.round(vStat?.deltaPrevPct || 0))),
+            productUrl: latestSnap.product_url,
+          });
+          if (isTargetHit) {
+            msg = `🎯 <b>¡ALCANZÓ TU PRECIO OBJETIVO ($${targetPrice.toLocaleString("es-CL")})!</b>\n\n` + msg;
           }
+          sendTelegramNotification({ token, chatId, text: msg }).catch(() => {});
         }
       }
     }
@@ -195,6 +211,38 @@ export async function refreshAllTrackedItems() {
     }
   }
   setSetting("last_auto_run_at", new Date().toISOString());
+
+  // Alerta opcional de carrito completo bajo presupuesto objetivo
+  try {
+    const telegramEnabled = getSetting("telegram_enabled") === "1";
+    const token = getSetting("telegram_token");
+    const chatId = getSetting("telegram_chat_id");
+    const cartTargetClp = Number(getSetting("telegram_cart_target_clp", "0"));
+    if (telegramEnabled && token && chatId && cartTargetClp > 0) {
+      const { listCarts, evaluateCart } = await import("./carts.mjs");
+      const carts = listCarts();
+      for (const c of carts) {
+        const ev = evaluateCart(c);
+        const top = ev?.singleStoreRanking?.[0];
+        const bestNet = top ? (top.netDiscountedTotalClp ?? top.netTotalClp ?? 0) : 0;
+        if (bestNet > 0 && bestNet <= cartTargetClp) {
+          const alertKey = `tg_cart_alert_${c.id}`;
+          const prevSent = Number(getSetting(alertKey, "0"));
+          if (prevSent !== bestNet) {
+            setSetting(alertKey, String(bestNet));
+            const text =
+              `🛒🎯 <b>¡CARRITO BAJO TU PRESUPUESTO!</b>\n\n` +
+              `<b>Carrito:</b> ${c.name}\n` +
+              `<b>Mejor súper:</b> ${top.storeName}\n` +
+              `<b>Total Neto:</b> $${bestNet.toLocaleString("es-CL")} <i>(Objetivo: $${cartTargetClp.toLocaleString("es-CL")})</i>\n\n` +
+              `<i>Monitoreado por SuperPrecio CL</i>`;
+            sendTelegramNotification({ token, chatId, text }).catch(() => {});
+          }
+        }
+      }
+    }
+  } catch {}
+
   return updated;
 }
 

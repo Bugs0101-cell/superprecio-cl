@@ -15,18 +15,22 @@ import {
   listTrackedItems,
   removePinnedProduct,
   setSetting,
+  touchOrInsertSnapshot,
+  updateTrackedItem,
 } from "./db.mjs";
 import {
   addCartItem,
   createCart,
   deleteCart,
   getCartById,
+  importCartFromLiderItems,
   listCarts,
   refreshCartPrices,
   removeCartItem,
   seedDefaultCartIfNeeded,
   updateCartCriteria,
   updateCartItem,
+  updateCartItemLiderOffer,
   updateCartSettings,
 } from "./carts.mjs";
 import {
@@ -42,6 +46,7 @@ import {
 } from "./normalizer.mjs";
 import {
   fetchProductByUrl,
+  parseLiderCartPayload,
   parseLiderRawInput,
   searchAllStores,
   STORES,
@@ -104,10 +109,25 @@ function isAuthenticated(req) {
   return false;
 }
 
+function getImportToken() {
+  if (!ACCESS_PASSWORD) return "";
+  const ver = getSetting("import_token_version", "1");
+  return signToken(`import-lider:v${ver}`);
+}
+
 function isImportAuthorized(req, urlObj) {
   if (isAuthenticated(req)) return true;
   const token = urlObj.searchParams.get("token") || "";
-  return safeEqualStr(token, signToken("import-lider"));
+  if (safeEqualStr(token, getImportToken())) return true;
+  const ver = getSetting("import_token_version", "1");
+  return ver === "1" && safeEqualStr(token, signToken("import-lider"));
+}
+
+function maskSecret(val = "") {
+  const s = String(val || "").trim();
+  if (!s) return "";
+  if (s.length <= 10) return "••••••••";
+  return `${s.slice(0, 5)}••••••${s.slice(-4)}`;
 }
 
 const MIME_TYPES = {
@@ -262,19 +282,84 @@ const server = http.createServer(async (req, res) => {
         });
       }
       const body = await readJsonBody(req);
-      const products = parseLiderRawInput(body.rawContent || "", body.url || "");
+      let cartItems = Array.isArray(body.cartItems) ? body.cartItems : [];
+      if (cartItems.length === 0 && typeof body.rawContent === "string") {
+        const trimmedRaw = body.rawContent.trim();
+        if (trimmedRaw.startsWith("{") || trimmedRaw.startsWith("[")) {
+          try {
+            const parsedJson = JSON.parse(trimmedRaw);
+            if (Array.isArray(parsedJson) && parsedJson.some((x) => x?.name)) {
+              cartItems = parsedJson;
+            } else if (Array.isArray(parsedJson?.cartItems)) {
+              cartItems = parsedJson.cartItems;
+            }
+          } catch {}
+        }
+      }
+
+      const products = parseLiderCartPayload({
+        rawContent: body.rawContent || "",
+        cartItems,
+        url: body.url || "",
+      });
+
       if (products.length === 0) {
         return sendJson(res, 400, {
           error:
-            "No se encontraron productos de Lider en el contenido pegado. Asegúrate de copiar el contenido de __NEXT_DATA__ o el HTML de la búsqueda.",
+            "No se encontraron productos de Lider en el contenido pegado. Asegúrate de copiar el carrito (/cart), la búsqueda o ficha de producto.",
         });
       }
 
+      const isCartMode =
+        body.mode === "cart" ||
+        String(body.url || "").includes("/cart") ||
+        cartItems.length > 0 ||
+        products.some((p) => Number(p.cartQuantity) > 0);
+
       let trackedItem = null;
       const matchedTitles = [];
+
+      if (isCartMode && !body.trackedItemId) {
+        const cartRes = await importCartFromLiderItems({
+          name:
+            body.cartName ||
+            `🟦 Carrito Lider (${new Date().toLocaleDateString("es-CL")})`,
+          items: products,
+        });
+
+        // Sincronizar también snapshots en productos seguidos que coincidan
+        const trackedItems = listTrackedItems();
+        for (const item of trackedItems) {
+          const query = item.search_query || item.title;
+          let candidates = products.filter(
+            (p) => matchScore(query, p.name) >= 0.5 || matchScore(p.name, query) >= 0.5
+          );
+          if (item.preferred_unit && item.preferred_unit !== "auto") {
+            const unitFiltered = candidates.filter((p) => p.unit === item.preferred_unit);
+            if (unitFiltered.length > 0) candidates = unitFiltered;
+          }
+          if (candidates.length > 0) {
+            candidates.sort((a, b) => a.unitPrice - b.unitPrice);
+            touchOrInsertSnapshot({ trackedItemId: item.id, product: candidates[0] });
+            matchedTitles.push(item.title);
+          }
+        }
+
+        return sendJson(res, 200, {
+          isCartImport: true,
+          count: products.length,
+          importedItemsCount: cartRes.importedItemsCount,
+          cartId: cartRes.cartId,
+          cart: cartRes.cart,
+          matchedTrackedCount: matchedTitles.length,
+          matchedTitles,
+          products,
+        });
+      }
+
       if (body.trackedItemId) {
         products.sort((a, b) => a.unitPrice - b.unitPrice);
-        insertSnapshot({
+        touchOrInsertSnapshot({
           trackedItemId: Number(body.trackedItemId),
           product: products[0],
         });
@@ -293,7 +378,7 @@ const server = http.createServer(async (req, res) => {
           }
           if (candidates.length > 0) {
             candidates.sort((a, b) => a.unitPrice - b.unitPrice);
-            insertSnapshot({ trackedItemId: item.id, product: candidates[0] });
+            touchOrInsertSnapshot({ trackedItemId: item.id, product: candidates[0] });
             matchedTitles.push(item.title);
           }
         }
@@ -308,13 +393,14 @@ const server = http.createServer(async (req, res) => {
             preferredUnit: bestProd.unit || "auto",
             category: "Despensa",
           });
-          insertSnapshot({ trackedItemId: newId, product: bestProd });
+          touchOrInsertSnapshot({ trackedItemId: newId, product: bestProd });
           trackedItem = await refreshTrackedItem(newId);
           matchedTitles.push(bestProd.name);
         }
       }
 
       return sendJson(res, 200, {
+        isCartImport: false,
         count: products.length,
         matchedTrackedCount: matchedTitles.length,
         matchedTitles,
@@ -334,7 +420,20 @@ const server = http.createServer(async (req, res) => {
     if (pathname === "/api/bookmarklet-info" && method === "GET") {
       return sendJson(res, 200, {
         authEnabled: Boolean(ACCESS_PASSWORD),
-        importToken: ACCESS_PASSWORD ? signToken("import-lider") : null,
+        importToken: ACCESS_PASSWORD ? getImportToken() : null,
+        tokenVersion: getSetting("import_token_version", "1"),
+      });
+    }
+
+    if (pathname === "/api/bookmarklet-rotate" && method === "POST") {
+      const curVer = Number(getSetting("import_token_version", "1")) || 1;
+      const nextVer = String(curVer + 1);
+      setSetting("import_token_version", nextVer);
+      return sendJson(res, 200, {
+        ok: true,
+        authEnabled: Boolean(ACCESS_PASSWORD),
+        importToken: ACCESS_PASSWORD ? getImportToken() : null,
+        tokenVersion: nextVer,
       });
     }
 
@@ -413,6 +512,7 @@ const server = http.createServer(async (req, res) => {
         mode: body.mode || "mixed",
         preferredUnit: body.preferredUnit || "auto",
         category: body.category || "Despensa",
+        targetPriceClp: body.targetPriceClp ?? null,
       });
 
       if (body.initialProduct) {
@@ -445,6 +545,13 @@ const server = http.createServer(async (req, res) => {
 
       if (!action && method === "GET") {
         const item = getTrackedItemById(itemId);
+        if (!item) return sendJson(res, 404, { error: "No encontrado" });
+        return sendJson(res, 200, { item });
+      }
+
+      if (!action && method === "PATCH") {
+        const body = await readJsonBody(req);
+        const item = updateTrackedItem(itemId, body);
         if (!item) return sendJson(res, 404, { error: "No encontrado" });
         return sendJson(res, 200, { item });
       }
@@ -536,20 +643,28 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 201, { cart: getCartById(cartId), carts: listCarts() });
     }
 
-    const cartItemMatch = pathname.match(/^\/api\/carts\/(\d+)\/items\/(\d+)$/);
+    const cartItemMatch = pathname.match(/^\/api\/carts\/(\d+)\/items\/(\d+)(?:\/([a-z-]+))?$/);
     if (cartItemMatch) {
       const cartId = Number(cartItemMatch[1]);
       const itemId = Number(cartItemMatch[2]);
+      const itemAction = cartItemMatch[3];
 
-      if (method === "PATCH") {
+      if (!itemAction && method === "PATCH") {
         const body = await readJsonBody(req);
         const cart = updateCartItem(cartId, itemId, body);
         return sendJson(res, 200, { cart, carts: listCarts() });
       }
 
-      if (method === "DELETE") {
+      if (!itemAction && method === "DELETE") {
         const cart = removeCartItem(cartId, itemId);
         return sendJson(res, 200, { cart, carts: listCarts() });
+      }
+
+      if (itemAction === "lider" && method === "POST") {
+        const body = await readJsonBody(req);
+        const payload = body.product || body.rawContent || "";
+        const resUpdate = updateCartItemLiderOffer(cartId, itemId, payload);
+        return sendJson(res, 200, { ...resUpdate, carts: listCarts() });
       }
     }
 
@@ -648,31 +763,53 @@ const server = http.createServer(async (req, res) => {
 
     // 13. Endpoints de Telegram (Configuración y Prueba)
     if (pathname === "/api/telegram" && method === "GET") {
+      const rawToken = getSetting("telegram_token", "");
       return sendJson(res, 200, {
-        token: getSetting("telegram_token", ""),
+        token: maskSecret(rawToken),
+        hasToken: Boolean(rawToken),
         chatId: getSetting("telegram_chat_id", ""),
         enabled: getSetting("telegram_enabled", "0") === "1",
         thresholdPct: Number(getSetting("telegram_threshold_pct", "12")),
+        cartTargetTotalClp: Number(getSetting("telegram_cart_target_clp", "0")),
+        weeklySummaryEnabled: getSetting("telegram_weekly_enabled", "0") === "1",
       });
     }
 
     if (pathname === "/api/telegram" && method === "POST") {
       const body = await readJsonBody(req);
-      if (body.token !== undefined) setSetting("telegram_token", String(body.token).trim());
+      if (body.clearToken === true) {
+        setSetting("telegram_token", "");
+      } else if (body.token !== undefined) {
+        const candidate = String(body.token).trim();
+        if (candidate && !candidate.includes("••")) {
+          setSetting("telegram_token", candidate);
+        }
+      }
       if (body.chatId !== undefined) setSetting("telegram_chat_id", String(body.chatId).trim());
       if (body.enabled !== undefined) setSetting("telegram_enabled", body.enabled ? "1" : "0");
       if (body.thresholdPct !== undefined) setSetting("telegram_threshold_pct", String(body.thresholdPct));
+      if (body.cartTargetTotalClp !== undefined) {
+        const cVal = Math.max(0, Math.round(Number(body.cartTargetTotalClp) || 0));
+        setSetting("telegram_cart_target_clp", String(cVal));
+      }
+      if (body.weeklySummaryEnabled !== undefined) {
+        setSetting("telegram_weekly_enabled", body.weeklySummaryEnabled ? "1" : "0");
+      }
       return sendJson(res, 200, { ok: true });
     }
 
     if (pathname === "/api/telegram/test" && method === "POST") {
       const body = await readJsonBody(req);
-      const token = body.token || getSetting("telegram_token");
+      const rawBodyToken = String(body.token || "").trim();
+      const token =
+        rawBodyToken && !rawBodyToken.includes("••")
+          ? rawBodyToken
+          : getSetting("telegram_token");
       const chatId = body.chatId || getSetting("telegram_chat_id");
       const resTele = await sendTelegramNotification({
         token,
         chatId,
-        text: "🛒 <b>SuperPrecio CL</b>\n¡Prueba de alerta exitosa! Tu bot de Telegram está conectado correctamente y te enviará notificaciones cuando tus productos bajen a su piso histórico.",
+        text: "🛒 <b>SuperPrecio CL</b>\n¡Prueba de alerta exitosa! Tu bot de Telegram está conectado correctamente y te enviará notificaciones cuando tus productos bajen a su piso histórico o alcancen tu precio objetivo.",
       });
       return sendJson(res, resTele.ok ? 200 : 400, resTele);
     }

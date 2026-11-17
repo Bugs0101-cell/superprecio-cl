@@ -97,17 +97,20 @@ export async function verifyProductUrl(rawUrl, store = "") {
   }
 }
 
-function resolveBrandAndNutrition(name, rawBrand, unitMetrics, price) {
+function resolveBrandAndNutrition(name, rawBrand, unitMetrics, price, description = "") {
   const brand = inferBrand(name, rawBrand);
   const nutrition = estimateProteinMetrics(
     name,
     unitMetrics.unit,
     unitMetrics.baseAmount,
     price,
-    brand
+    brand,
+    description
   );
   return {
     brand,
+    inferredCategory: nutrition.inferredCategory,
+    nutritionSeals: nutrition.nutritionSeals || [],
     hasProteinData: nutrition.hasProteinData,
     hasNutritionData: nutrition.hasNutritionData,
     proteinGramsTotal: nutrition.proteinGramsTotal,
@@ -596,7 +599,13 @@ function buildNormalizedLiderProduct({
     description,
   });
 
-  const nutFields = resolveBrandAndNutrition(name, brand, unitMetrics, price);
+  const nutFields = resolveBrandAndNutrition(
+    name,
+    brand,
+    unitMetrics,
+    price,
+    `${description || ""} ${promoText || ""}`
+  );
   const effectiveUnitPrice =
     bundlePricePerItem && unitMetrics.baseAmount > 0
       ? Math.round(bundlePricePerItem / unitMetrics.baseAmount)
@@ -736,7 +745,87 @@ export function parseLiderRawInput(rawText, pageUrl = "") {
     }
   }
 
+  // Fallback 3: Bloques de carrito pegados en Markdown o DOM de lider.cl/cart
+  if (mapped.length === 0 && /lider\.cl\/ip\//i.test(rawText)) {
+    const linkRe = /###\s+([^\n\]]+)[\s\S]{0,120}?\((https:\/\/www\.lider\.cl\/ip\/[^\s)]+)\)/g;
+    const matches = [...rawText.matchAll(linkRe)];
+    for (let i = 0; i < matches.length; i++) {
+      const m = matches[i];
+      const name = m[1].replace(/\s+/g, " ").trim();
+      const prodUrl = m[2].trim();
+      const idMatch = prodUrl.match(/\/(\d{6,20})(?:$|\?)/);
+      const id = idMatch ? idMatch[1] : `cart-${i}`;
+      const blockStart = m.index + m[0].length;
+      const blockEnd = i + 1 < matches.length ? matches[i + 1].index : Math.min(rawText.length, blockStart + 350);
+      const tail = rawText.slice(blockStart, blockEnd);
+      const prevChunk = rawText.slice(Math.max(0, m.index - 120), m.index);
+
+      const prices = [...tail.matchAll(/\$\s*([\d.]+)/g)].map((p) => parseClpString(p[1])).filter(Boolean);
+      const lineTotal = prices[0];
+      const unitExplicit = tail.match(/\$\s*([\d.]+)\s*un\b/i);
+      const costabaMatch = tail.match(/Costaba\s*\$\s*([\d.]+)\s*(un)?/i);
+      const bundleMatch = prevChunk.match(/(\d+)\s*x\s*\$\s*([\d.]+)/i) || tail.match(/(\d+)\s*x\s*\$\s*([\d.]+)/i);
+      const qtyLines = tail
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => /^\d{1,2}$/.test(l));
+      const qty = qtyLines.length > 0 ? Math.max(1, Number(qtyLines[qtyLines.length - 1])) : 1;
+
+      if (lineTotal) {
+        const unitPricePkg = unitExplicit
+          ? parseClpString(unitExplicit[1])
+          : Math.round(lineTotal / qty);
+        const listPrice = costabaMatch ? parseClpString(costabaMatch[1]) : undefined;
+        const bundleParsed = bundleMatch ? parseBundle(`${bundleMatch[1]} x $${bundleMatch[2]}`) : null;
+        const prod = buildNormalizedLiderProduct({
+          id,
+          name,
+          price: unitPricePkg,
+          listPrice,
+          promoText: bundleParsed?.description || null,
+          bundlePricePerItem: bundleParsed?.unitPriceInBundle ?? null,
+          url: prodUrl,
+        });
+        prod.cartQuantity = qty;
+        mapped.push(prod);
+      }
+    }
+  }
+
   return mapped;
+}
+
+export function parseLiderCartPayload({ rawContent = "", cartItems = [], url = "" }) {
+  if (Array.isArray(cartItems) && cartItems.length > 0) {
+    const out = [];
+    for (const ci of cartItems) {
+      if (!ci?.name) continue;
+      const qty = Math.max(1, Number(ci.qty) || 1);
+      const rawLine = parseClpString(ci.linePrice);
+      const rawUnit = parseClpString(ci.unitPrice);
+      const pkgPrice = rawUnit || (rawLine ? Math.round(rawLine / qty) : undefined);
+      if (!pkgPrice) continue;
+      const prodUrl = ci.url || url || "https://www.lider.cl";
+      const idMatch = String(prodUrl).match(/\/(\d{6,20})(?:$|\?)/);
+      const id = ci.externalId || (idMatch ? idMatch[1] : `lider-cart-${Date.now()}-${out.length}`);
+      const bundleParsed = ci.promoText ? parseBundle(ci.promoText) : null;
+      const prod = buildNormalizedLiderProduct({
+        id,
+        name: ci.name,
+        brand: ci.brand || "",
+        price: pkgPrice,
+        listPrice: parseClpString(ci.listPrice),
+        promoText: bundleParsed?.description || ci.promoText || null,
+        bundlePricePerItem: bundleParsed?.unitPriceInBundle ?? null,
+        imageUrl: ci.imageUrl || "",
+        url: prodUrl,
+      });
+      prod.cartQuantity = qty;
+      out.push(prod);
+    }
+    if (out.length > 0) return out;
+  }
+  return parseLiderRawInput(rawContent, url);
 }
 
 function mapLiderItem(p, pageUrl = "") {

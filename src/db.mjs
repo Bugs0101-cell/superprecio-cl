@@ -7,7 +7,9 @@ import {
   estimateProteinMetrics,
   extractQuantityFromText,
   inferBrand,
+  inferProductCategory,
   normalizeProductUrl,
+  normalizeText,
   parseBundle,
 } from "./normalizer.mjs";
 
@@ -36,6 +38,7 @@ db.exec(`
     mode TEXT NOT NULL DEFAULT 'mixed',
     preferred_unit TEXT NOT NULL DEFAULT 'auto',
     category TEXT NOT NULL DEFAULT 'Despensa',
+    target_price_clp INTEGER,
     last_checked_at TEXT,
     created_at TEXT NOT NULL
   );
@@ -103,7 +106,12 @@ export function setSetting(key, value) {
   ).run(key, String(value));
 }
 
-// Inicializar ajustes por defecto (actualización automática cada 360 min = 6 horas)
+// Inicializar ajustes por defecto y migraciones livianas
+const trackedCols = db.prepare("PRAGMA table_info(tracked_items)").all();
+if (!trackedCols.some((c) => c.name === "target_price_clp")) {
+  db.exec("ALTER TABLE tracked_items ADD COLUMN target_price_clp INTEGER;");
+}
+
 if (getSetting("auto_interval_minutes") === null) {
   setSetting("auto_interval_minutes", "360");
 }
@@ -130,12 +138,17 @@ export function createTrackedItem({
   mode = "mixed",
   preferredUnit = "auto",
   category = "Despensa",
+  targetPriceClp = null,
 }) {
   const now = new Date().toISOString();
+  const parsedTarget =
+    targetPriceClp !== null && targetPriceClp !== undefined && Number(targetPriceClp) > 0
+      ? Math.round(Number(targetPriceClp))
+      : null;
   const res = db
     .prepare(
-      `INSERT INTO tracked_items (title, search_query, mode, preferred_unit, category, created_at)
-       VALUES (?, ?, ?, ?, ?, ?)`
+      `INSERT INTO tracked_items (title, search_query, mode, preferred_unit, category, target_price_clp, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       title.trim(),
@@ -143,9 +156,54 @@ export function createTrackedItem({
       mode,
       preferredUnit,
       category.trim() || "Despensa",
+      parsedTarget,
       now
     );
   return Number(res.lastInsertRowid);
+}
+
+export function updateTrackedItem(id, fields = {}) {
+  const item = db
+    .prepare("SELECT * FROM tracked_items WHERE id = ?")
+    .get(Number(id));
+  if (!item) return null;
+
+  const nextTitle =
+    typeof fields.title === "string" && fields.title.trim()
+      ? fields.title.trim()
+      : item.title;
+  const nextQuery =
+    typeof fields.searchQuery === "string"
+      ? fields.searchQuery.trim()
+      : item.search_query;
+  const nextUnit =
+    typeof fields.preferredUnit === "string" && fields.preferredUnit.trim()
+      ? fields.preferredUnit.trim()
+      : item.preferred_unit;
+  const nextCategory =
+    typeof fields.category === "string" && fields.category.trim()
+      ? fields.category.trim()
+      : item.category;
+
+  let nextTarget = item.target_price_clp ?? null;
+  if (Object.prototype.hasOwnProperty.call(fields, "targetPriceClp")) {
+    const val = Number(fields.targetPriceClp);
+    nextTarget =
+      fields.targetPriceClp === null ||
+      fields.targetPriceClp === "" ||
+      !Number.isFinite(val) ||
+      val <= 0
+        ? null
+        : Math.round(val);
+  }
+
+  db.prepare(
+    `UPDATE tracked_items
+     SET title = ?, search_query = ?, preferred_unit = ?, category = ?, target_price_clp = ?
+     WHERE id = ?`
+  ).run(nextTitle, nextQuery, nextUnit, nextCategory, nextTarget, Number(id));
+
+  return getTrackedItemById(id);
 }
 
 export function deleteTrackedItem(id) {
@@ -246,6 +304,66 @@ export function insertSnapshot({
 }
 
 /**
+ * Inserta snapshot solo si cambió algún precio/formato/promo respecto al último
+ * snapshot de esa tienda; si todo sigue idéntico, actualiza su timestamp para evitar
+ * duplicar filas redundantes en las corridas automáticas de 6 horas.
+ */
+export function touchOrInsertSnapshot({
+  trackedItemId,
+  pinnedProductId = null,
+  product,
+  recordedAt = new Date().toISOString(),
+}) {
+  const latest = db
+    .prepare(
+      `SELECT * FROM price_snapshots
+       WHERE tracked_item_id = ? AND store = ?
+       ORDER BY recorded_at DESC, id DESC LIMIT 1`
+    )
+    .get(Number(trackedItemId), product.store);
+
+  const extId = String(product.externalId || product.sku || "manual");
+  const nextPrice = Math.round(product.price);
+  const nextUnitPrice = Math.round(product.unitPrice);
+  const nextEffUnit = Math.round(product.effectiveUnitPrice ?? product.unitPrice);
+  const nextList = product.listPrice ? Math.round(product.listPrice) : null;
+  const nextMember = product.memberPrice ? Math.round(product.memberPrice) : null;
+  const nextPromo = product.promoText || "";
+  const nextFmt = product.formatLabel || "";
+
+  const isUnchanged =
+    latest &&
+    String(latest.external_id) === extId &&
+    Number(latest.price) === nextPrice &&
+    Number(latest.unit_price) === nextUnitPrice &&
+    Number(latest.effective_unit_price) === nextEffUnit &&
+    (latest.list_price ?? null) === nextList &&
+    (latest.member_price ?? null) === nextMember &&
+    (latest.promo_text || "") === nextPromo &&
+    (latest.format_label || "") === nextFmt;
+
+  if (isUnchanged) {
+    const nextUrl = product.url || latest.product_url || "";
+    const nextImg = product.imageUrl || latest.image_url || "";
+    const nextPinnedId = pinnedProductId ? Number(pinnedProductId) : latest.pinned_product_id;
+    db.prepare(
+      `UPDATE price_snapshots
+       SET recorded_at = ?, product_url = ?, image_url = ?, pinned_product_id = ?
+       WHERE id = ?`
+    ).run(recordedAt, nextUrl, nextImg, nextPinnedId, latest.id);
+
+    db.prepare("UPDATE tracked_items SET last_checked_at = ? WHERE id = ?").run(
+      recordedAt,
+      Number(trackedItemId)
+    );
+    return { inserted: false, touchedId: latest.id };
+  }
+
+  insertSnapshot({ trackedItemId, pinnedProductId, product, recordedAt });
+  return { inserted: true };
+}
+
+/**
  * Enriquecer un producto seguido con:
  * - Productos fijados (pinnedProducts)
  * - Último snapshot vigente por cada supermercado (latestByStore)
@@ -255,7 +373,12 @@ export function insertSnapshot({
 export function enrichTrackedItemWithStats(item) {
   const pinnedProducts = db
     .prepare("SELECT * FROM pinned_products WHERE tracked_item_id = ? ORDER BY id ASC")
-    .all(item.id);
+    .all(item.id)
+    .map((p) => ({
+      ...p,
+      brand: inferBrand(p.name, p.brand),
+      url: normalizeProductUrl(p.url, p.store),
+    }));
 
   // Obtener todos los snapshots históricos ordenados cronológicamente
   const snapshots = db
@@ -310,38 +433,56 @@ export function enrichTrackedItemWithStats(item) {
         : 0;
 
     // --- Semáforo "¿Compro hoy o espero?" & Detector de Ofertas Infladas ---
-    let signal = "normal";
-    let signalLabel = "🟡 Precio Habitual";
-    let signalExplanation = "El precio está en su rango promedio.";
+    // Exige al menos 3 observaciones de precio para evitar falsos "Piso Histórico" en el día 1.
+    let signal = "new";
+    let signalLabel = "🆕 Precio Base (faltan med.)";
+    let signalExplanation = `Registradas ${list.length}/3 variaciones de precio en esta tienda para detectar piso histórico.`;
 
-    const isAtFloor =
-      latest.unit_price <= minUnitPrice * 1.03 ||
-      (avgUnitPrice > 0 && latest.unit_price <= avgUnitPrice * 0.88);
-    const hasPromoBadge = Boolean(latest.promo_text || latest.list_price);
-    const isInflatedPromo =
-      hasPromoBadge && avgUnitPrice > 0 && latest.unit_price >= avgUnitPrice * 0.99;
+    if (list.length >= 3) {
+      signal = "normal";
+      signalLabel = "🟡 Precio Habitual";
+      signalExplanation = "El precio está en su rango promedio.";
 
-    if (isAtFloor) {
-      signal = "floor";
-      signalLabel = "🟢 Piso Histórico (¡Stockeo!)";
-      const dropPct =
-        avgUnitPrice > 0
-          ? Math.round(((avgUnitPrice - latest.unit_price) / avgUnitPrice) * 100)
-          : 0;
-      signalExplanation = `¡Excelente momento para abastecerse! Está ${
-        dropPct > 0 ? `un ${dropPct}% bajo su promedio` : "en su mínimo histórico"
-      }.`;
-    } else if (isInflatedPromo) {
-      signal = "inflated";
-      signalLabel = "🔴 Oferta Dudosa / Inflada";
-      signalExplanation =
-        "Pese a mostrar cartel de oferta, su precio actual es igual o superior al promedio histórico registrado.";
-    } else if (avgUnitPrice > 0 && latest.unit_price >= avgUnitPrice * 1.08) {
-      signal = "expensive";
-      signalLabel = "🔴 Sobre el Promedio";
-      signalExplanation =
-        "Precio más alto de lo normal (+8% sobre su promedio). Conviene esperar.";
+      const isAtFloor =
+        latest.unit_price <= minUnitPrice * 1.03 ||
+        (avgUnitPrice > 0 && latest.unit_price <= avgUnitPrice * 0.88);
+      const hasPromoBadge = Boolean(latest.promo_text || latest.list_price);
+      const isInflatedPromo =
+        hasPromoBadge && avgUnitPrice > 0 && latest.unit_price >= avgUnitPrice * 0.99;
+
+      if (isAtFloor) {
+        signal = "floor";
+        signalLabel = "🟢 Piso Histórico (¡Stockeo!)";
+        const dropPct =
+          avgUnitPrice > 0
+            ? Math.round(((avgUnitPrice - latest.unit_price) / avgUnitPrice) * 100)
+            : 0;
+        signalExplanation = `¡Excelente momento para abastecerse! Está ${
+          dropPct > 0 ? `un ${dropPct}% bajo su promedio` : "en su mínimo histórico"
+        }.`;
+      } else if (isInflatedPromo) {
+        signal = "inflated";
+        signalLabel = "🔴 Oferta Dudosa / Inflada";
+        signalExplanation =
+          "Pese a mostrar cartel de oferta, su precio actual es igual o superior al promedio histórico registrado.";
+      } else if (avgUnitPrice > 0 && latest.unit_price >= avgUnitPrice * 1.08) {
+        signal = "expensive";
+        signalLabel = "🔴 Sobre el Promedio";
+        signalExplanation =
+          "Precio más alto de lo normal (+8% sobre su promedio). Conviene esperar.";
+      }
     }
+
+    const priceRangePct =
+      maxUnitPrice > minUnitPrice
+        ? Math.max(
+            0,
+            Math.min(
+              100,
+              Math.round(((latest.unit_price - minUnitPrice) / (maxUnitPrice - minUnitPrice)) * 100)
+            )
+          )
+        : 50;
 
     // --- Detección de Reduflación (Shrinkflation) ---
     let shrinkflation = null;
@@ -360,7 +501,9 @@ export function enrichTrackedItemWithStats(item) {
     }
 
     const spec = extractQuantityFromText(latest.product_name, latest.format_label || "");
-    const baseAmt = spec?.baseAmount || 1;
+    const inferredAmt =
+      latest.price > 0 && latest.unit_price > 0 ? latest.price / latest.unit_price : 1;
+    const baseAmt = spec?.baseAmount || inferredAmt;
     const brandClean = inferBrand(latest.product_name, latest.brand);
     const nut = estimateProteinMetrics(
       latest.product_name,
@@ -400,6 +543,9 @@ export function enrichTrackedItemWithStats(item) {
       nutrition_score: nut.nutritionScore,
       nutrition_grade: nut.nutritionGrade,
       nutrition_badge: nut.nutritionBadge,
+      nutrition_seals: nut.nutritionSeals || [],
+      inferred_category: nut.inferredCategory || inferProductCategory(latest.product_name),
+      price_range_pct: priceRangePct,
       is_pure: purity.isPure,
       is_blend: purity.isBlend,
       purity_warning: purity.purityWarning,
@@ -411,6 +557,7 @@ export function enrichTrackedItemWithStats(item) {
     variabilityByStore[store] = {
       store,
       observations: list.length,
+      firstUnitPrice: first.unit_price,
       minUnitPrice,
       maxUnitPrice,
       avgUnitPrice,
@@ -420,6 +567,7 @@ export function enrichTrackedItemWithStats(item) {
       deltaPrevPct,
       deltaFirstPct,
       volatilityPct,
+      priceRangePct,
       signal,
       signalLabel,
       signalExplanation,
@@ -436,6 +584,13 @@ export function enrichTrackedItemWithStats(item) {
   const byUnit = [...candidatePool].sort((a, b) => a.unit_price - b.unit_price);
   const bestByUnitPrice = byUnit[0] || null;
   const worstByUnitPrice = byUnit.length > 1 ? byUnit[byUnit.length - 1] : null;
+
+  for (const entry of activeLatest) {
+    entry.vs_best_pct =
+      bestByUnitPrice?.unit_price > 0
+        ? Math.max(0, Math.round(((entry.unit_price - bestByUnitPrice.unit_price) / bestByUnitPrice.unit_price) * 100))
+        : 0;
+  }
 
   const byEffective = [...candidatePool].sort(
     (a, b) => (a.effective_unit_price || a.unit_price) - (b.effective_unit_price || b.unit_price)
@@ -473,7 +628,8 @@ export function enrichTrackedItemWithStats(item) {
 
   const normalizedHistory = snapshots.map((s) => {
     const sSpec = extractQuantityFromText(s.product_name, s.format_label || "");
-    const sBase = sSpec?.baseAmount || 1;
+    const sInferredAmt = s.price > 0 && s.unit_price > 0 ? s.price / s.unit_price : 1;
+    const sBase = sSpec?.baseAmount || sInferredAmt;
     const sBundle = s.promo_text ? parseBundle(s.promo_text) : null;
     const sPromoUnit =
       sBundle?.unitPriceInBundle && sBundle.unitPriceInBundle < s.price
@@ -536,26 +692,63 @@ export function getAllSnapshotsForExport() {
 }
 
 
+export function listCartItemWeightsForIpc() {
+  try {
+    return db
+      .prepare("SELECT label, search_query, quantity FROM cart_items")
+      .all();
+  } catch {
+    return [];
+  }
+}
+
+function matchCartWeightForTrackedItem(item, cartRows = []) {
+  if (!cartRows || cartRows.length === 0) return { inCart: false, qty: 1 };
+  const itemTokens = normalizeText(item.search_query || item.title)
+    .split(" ")
+    .filter((w) => w.length >= 3);
+  if (itemTokens.length === 0) return { inCart: false, qty: 1 };
+
+  let matchedQty = 0;
+  for (const row of cartRows) {
+    const rowNorm = normalizeText(`${row.label || ""} ${row.search_query || ""}`);
+    const hits = itemTokens.filter((t) => rowNorm.includes(t)).length;
+    if (hits >= Math.min(2, itemTokens.length)) {
+      matchedQty += Math.max(1, Number(row.quantity) || 1);
+    }
+  }
+  return {
+    inCart: matchedQty > 0,
+    qty: matchedQty > 0 ? matchedQty : 1,
+  };
+}
+
 /**
  * Calcula el IPC Personal (Inflación Real de tu Canasta Hogar)
- * ponderando los productos monitoreados a lo largo del tiempo.
+ * ponderando los productos monitoreados por su peso en carritos activos.
  */
 export function calculatePersonalIpc() {
   const items = listTrackedItems();
   if (items.length === 0) {
     return {
       basketInflationPct: 0,
+      weightedBasketInflationPct: 0,
       monthlyInflationRatePct: 0,
       totalTrackedCount: 0,
+      weightedItemsCount: 0,
       storeInflation: {},
+      categoryBreakdown: [],
+      itemChanges: [],
       topIncreases: [],
       topDecreases: [],
       timeline: [],
     };
   }
 
+  const cartRows = listCartItemWeightsForIpc();
   const storeDeltas = { jumbo: [], santaisabel: [], unimarc: [], tottus: [], lider: [] };
   const itemChanges = [];
+  const categoryStats = {};
 
   for (const item of items) {
     const varMap = item.variabilityByStore || {};
@@ -563,56 +756,108 @@ export function calculatePersonalIpc() {
     let itemLastSum = 0;
     let storeCount = 0;
 
+    const { inCart, qty } = matchCartWeightForTrackedItem(item, cartRows);
+    const refPackPrice = Math.max(500, item.bestByUnitPrice?.price || item.bestByUnitPrice?.unit_price || 1000);
+    const weightClp = Math.round(qty * refPackPrice * (inCart ? 1.5 : 1));
+
     for (const [storeId, vStat] of Object.entries(varMap)) {
       if (vStat && vStat.observations >= 2) {
-        storeDeltas[storeId]?.push(vStat.deltaFirstPct);
-        itemFirstSum += vStat.minUnitPrice || vStat.avgUnitPrice;
-        itemLastSum += (item.latestByStore?.[storeId]?.unit_price || vStat.avgUnitPrice);
-        storeCount++;
+        storeDeltas[storeId]?.push({ pct: vStat.deltaFirstPct, weightClp });
+        const baseFirst = vStat.firstUnitPrice || vStat.avgUnitPrice || vStat.minUnitPrice;
+        const baseLast = item.latestByStore?.[storeId]?.unit_price || vStat.avgUnitPrice;
+        if (baseFirst > 0 && baseLast > 0) {
+          itemFirstSum += baseFirst;
+          itemLastSum += baseLast;
+          storeCount++;
+        }
       }
     }
 
     if (storeCount > 0 && itemFirstSum > 0) {
       const overallItemChange = Number((((itemLastSum - itemFirstSum) / itemFirstSum) * 100).toFixed(1));
+      const cat = item.category || "Despensa";
       itemChanges.push({
+        id: item.id,
         title: item.title,
-        category: item.category,
+        category: cat,
         changePct: overallItemChange,
         currentBest: item.bestByUnitPrice?.unit_price || 0,
         unit: item.bestByUnitPrice?.unit || "un",
+        weightQty: qty,
+        weightClp,
+        inCart,
       });
+
+      if (!categoryStats[cat]) {
+        categoryStats[cat] = { category: cat, weightedSum: 0, totalWeight: 0, itemCount: 0 };
+      }
+      categoryStats[cat].weightedSum += overallItemChange * weightClp;
+      categoryStats[cat].totalWeight += weightClp;
+      categoryStats[cat].itemCount += 1;
     }
   }
 
-  // Inflación acumulada promedio de la canasta
   const validChanges = itemChanges.map((i) => i.changePct);
   const basketInflationPct =
     validChanges.length > 0
       ? Number((validChanges.reduce((a, b) => a + b, 0) / validChanges.length).toFixed(1))
       : 0;
 
-  // Inflación por supermercado
+  const totalWeightAll = itemChanges.reduce((s, i) => s + i.weightClp, 0);
+  const weightedBasketInflationPct =
+    totalWeightAll > 0
+      ? Number(
+          (
+            itemChanges.reduce((s, i) => s + i.changePct * i.weightClp, 0) / totalWeightAll
+          ).toFixed(1)
+        )
+      : basketInflationPct;
+
+  // Inflación por supermercado (ponderada por gasto estimado de canasta)
   const storeInflation = {};
-  for (const [sId, deltas] of Object.entries(storeDeltas)) {
-    if (deltas.length > 0) {
-      const avg = Number((deltas.reduce((a, b) => a + b, 0) / deltas.length).toFixed(1));
+  for (const [sId, entries] of Object.entries(storeDeltas)) {
+    if (entries.length > 0) {
+      const simpleAvg = Number(
+        (entries.reduce((a, b) => a + b.pct, 0) / entries.length).toFixed(1)
+      );
+      const sWeight = entries.reduce((a, b) => a + b.weightClp, 0);
+      const weightedAvg =
+        sWeight > 0
+          ? Number(
+              (entries.reduce((a, b) => a + b.pct * b.weightClp, 0) / sWeight).toFixed(1)
+            )
+          : simpleAvg;
       storeInflation[sId] = {
         store: sId,
-        inflationPct: avg,
-        productsEvaluated: deltas.length,
+        inflationPct: weightedAvg,
+        simpleInflationPct: simpleAvg,
+        productsEvaluated: entries.length,
       };
     }
   }
 
-  // Top aumentos y top bajas
+  const categoryBreakdown = Object.values(categoryStats)
+    .map((c) => ({
+      category: c.category,
+      changePct:
+        c.totalWeight > 0 ? Number((c.weightedSum / c.totalWeight).toFixed(1)) : 0,
+      itemCount: c.itemCount,
+      totalWeightClp: c.totalWeight,
+    }))
+    .sort((a, b) => b.changePct - a.changePct);
+
   itemChanges.sort((a, b) => b.changePct - a.changePct);
   const topIncreases = itemChanges.filter((i) => i.changePct > 0).slice(0, 5);
   const topDecreases = [...itemChanges].reverse().filter((i) => i.changePct < 0).slice(0, 5);
 
   return {
     basketInflationPct,
+    weightedBasketInflationPct,
     totalTrackedCount: items.length,
+    weightedItemsCount: itemChanges.filter((i) => i.inCart).length,
     storeInflation,
+    categoryBreakdown,
+    itemChanges,
     topIncreases,
     topDecreases,
   };

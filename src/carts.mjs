@@ -9,10 +9,11 @@ import {
   estimateProteinMetrics,
   extractQuantityFromText,
   inferBrand,
+  inferProductCategory,
   normalizeProductUrl,
   parseBundle,
 } from "./normalizer.mjs";
-import { searchAllStores, STORES } from "./scrapers.mjs";
+import { parseLiderRawInput, searchAllStores, STORES } from "./scrapers.mjs";
 
 const ALL_STORES = ["jumbo", "santaisabel", "unimarc", "tottus", "lider"];
 const AUTO_STORES = ["jumbo", "santaisabel", "unimarc", "tottus"];
@@ -91,6 +92,7 @@ function toCartCandidate(p, storeOverride = null) {
     brand,
     price: p.price,
     listPrice: p.listPrice || null,
+    memberPrice: p.memberPrice || null,
     bundlePricePerItem: promoUnitPrice,
     promoMinQty,
     promoBundlePrice: bundle?.bundlePrice || null,
@@ -101,6 +103,7 @@ function toCartCandidate(p, storeOverride = null) {
     baseAmount,
     formatLabel: p.formatLabel || `1 ${unit}`,
     pricePer100: p.pricePer100 || Math.round(p.unitPrice / 10),
+    category: nut.inferredCategory || inferProductCategory(p.name),
     hasProteinData: nut.hasProteinData,
     proteinGramsTotal: nut.proteinGramsTotal,
     proteinPer100g: nut.proteinPer100g,
@@ -108,6 +111,7 @@ function toCartCandidate(p, storeOverride = null) {
     nutritionScore: nut.nutritionScore,
     nutritionGrade: nut.nutritionGrade,
     nutritionBadge: nut.nutritionBadge,
+    nutritionSeals: nut.nutritionSeals || [],
     linkStatus: p.linkStatus || "unknown",
     url: normalizeProductUrl(p.url || "", store),
     imageUrl: p.imageUrl || "",
@@ -141,6 +145,7 @@ function enrichCartCandidate(c, searchQuery, storeOverride = null) {
     promoBundlePrice: c.promoBundlePrice || bundle?.bundlePrice || null,
     effectiveUnitPrice,
     url: normalizeProductUrl(c.url || "", store),
+    category: nut.inferredCategory || inferProductCategory(c.name),
     hasProteinData: nut.hasProteinData,
     proteinGramsTotal: nut.proteinGramsTotal,
     proteinPer100g: nut.proteinPer100g,
@@ -148,6 +153,7 @@ function enrichCartCandidate(c, searchQuery, storeOverride = null) {
     nutritionScore: nut.nutritionScore,
     nutritionGrade: nut.nutritionGrade,
     nutritionBadge: nut.nutritionBadge,
+    nutritionSeals: nut.nutritionSeals || [],
     isPure: purity.isPure,
     isBlend: purity.isBlend,
     purityWarning: purity.purityWarning,
@@ -273,6 +279,14 @@ function compareByCartCriteria(prodA, prodB, lineA, lineB, criteria) {
   return (prodA.unitPrice || 0) - (prodB.unitPrice || 0) || lineA - lineB;
 }
 
+function formatAmountReadable(amount, unit) {
+  if (!Number.isFinite(amount) || amount <= 0) return `1 ${unit}`;
+  if (unit === "kg" && amount < 1) return `${Math.round(amount * 1000)} g`;
+  if (unit === "lt" && amount < 1) return `${Math.round(amount * 1000)} ml`;
+  const clean = Number(amount.toFixed(2));
+  return `${clean} ${unit === "lt" ? "L" : unit}`;
+}
+
 export function evaluateCart(cartRow) {
   const rawItems = db
     .prepare("SELECT * FROM cart_items WHERE cart_id = ? ORDER BY id ASC")
@@ -375,15 +389,38 @@ export function evaluateCart(cartRow) {
       if (chosen) {
         const scaledQty = getScaledQty(chosen);
         const pricing = computeLinePricing(chosen, scaledQty);
+        const itemCategory = chosen.category || inferProductCategory(chosen.name || row.label);
         const cardDiscount = calculateDiscountedPricing({
           store: storeId,
           price: pricing.unitPackagePrice,
           memberPrice: chosen.memberPrice,
+          category: itemCategory,
           activePrograms,
           dayOfWeek,
         });
 
-        const discountedLineTotal = cardDiscount.finalPrice * scaledQty;
+        const discountedLineTotal = Math.min(
+          pricing.lineTotal,
+          cardDiscount.finalPrice * scaledQty
+        );
+
+        const candSpec = getCandidateSpec(chosen);
+        let sizeDiffPct = 0;
+        let sizeDiffNote = null;
+        if (candSpec.unit === refSpec.unit && targetTotalAmount > 0 && candSpec.baseAmount > 0) {
+          const actualTotalAmount = candSpec.baseAmount * scaledQty;
+          sizeDiffPct = Math.round(
+            ((actualTotalAmount - targetTotalAmount) / targetTotalAmount) * 100
+          );
+          if (Math.abs(sizeDiffPct) >= 8) {
+            sizeDiffNote = `Formato ${formatAmountReadable(
+              actualTotalAmount,
+              candSpec.unit
+            )} vs ${formatAmountReadable(targetTotalAmount, refSpec.unit)} (${
+              sizeDiffPct > 0 ? "+" : ""
+            }${sizeDiffPct}%)`;
+          }
+        }
 
         storeOffers[storeId] = {
           store: storeId,
@@ -392,6 +429,8 @@ export function evaluateCart(cartRow) {
           ...pricing,
           baseQty: qty,
           isScaledQty: scaledQty !== qty,
+          sizeDiffPct,
+          sizeDiffNote,
           cardDiscount,
           discountedLineTotal,
           candidates,
@@ -402,7 +441,13 @@ export function evaluateCart(cartRow) {
     // Determinar qué supermercado gana en este ítem del carrito
     const availableOffers = Object.values(storeOffers);
     availableOffers.sort((a, b) =>
-      compareByCartCriteria(a.product, b.product, a.lineTotal, b.lineTotal, criteria)
+      compareByCartCriteria(
+        a.product,
+        b.product,
+        a.discountedLineTotal ?? a.lineTotal,
+        b.discountedLineTotal ?? b.lineTotal,
+        criteria
+      )
     );
 
     const bestOffer = availableOffers[0] || null;
@@ -464,9 +509,22 @@ export function evaluateCart(cartRow) {
     }
 
     if (foundCount > 0) {
-      const deliveryFee =
+      const deliveryFeeGross =
         enableFriction && totalClp < freeDeliveryThreshold ? deliveryCost : 0;
-      const netTotalClp = totalClp + deliveryFee;
+      const deliveryFeeAfterDiscount =
+        enableFriction && discountedTotalClp < freeDeliveryThreshold ? deliveryCost : 0;
+      const deliveryFee = deliveryFeeAfterDiscount;
+      const netDiscountedTotalClp = discountedTotalClp + deliveryFee;
+      const netTotalClp = netDiscountedTotalClp;
+      const netGrossTotalClp = totalClp + deliveryFeeGross;
+      const deliveryGapClp =
+        enableFriction && discountedTotalClp < freeDeliveryThreshold
+          ? freeDeliveryThreshold - discountedTotalClp
+          : 0;
+      const deliveryProgressPct =
+        freeDeliveryThreshold > 0
+          ? Math.min(100, Math.round((discountedTotalClp / freeDeliveryThreshold) * 100))
+          : 100;
       const totalProteinGrams = Math.round(totalProteinGramsRaw);
       const avgCostPer10gProtein =
         totalProteinGrams > 0 ? Math.round(proteinSpendClp / (totalProteinGrams / 10)) : null;
@@ -479,7 +537,13 @@ export function evaluateCart(cartRow) {
         normalTotalClp,
         discountedTotalClp,
         deliveryFee,
+        deliveryFeeAfterDiscount,
+        deliveryFeeGross,
+        deliveryGapClp,
+        deliveryProgressPct,
         netTotalClp,
+        netDiscountedTotalClp,
+        netGrossTotalClp,
         offerSavingsClp: Math.max(0, normalTotalClp - totalClp),
         cardSavingsClp: Math.max(0, totalClp - discountedTotalClp),
         foundCount,
@@ -495,10 +559,10 @@ export function evaluateCart(cartRow) {
     }
   }
 
-  // Priorizar tiendas con más productos encontrados, y luego menor costo total
+  // Priorizar tiendas con más productos encontrados, y luego menor costo neto (con dcto tarjetas + despacho)
   singleStoreRanking.sort((a, b) => {
     if (b.foundCount !== a.foundCount) return b.foundCount - a.foundCount;
-    return a.totalClp - b.totalClp;
+    return a.netDiscountedTotalClp - b.netDiscountedTotalClp || a.discountedTotalClp - b.discountedTotalClp;
   });
 
   const winnerSingleStore = singleStoreRanking[0] || null;
@@ -512,22 +576,29 @@ export function evaluateCart(cartRow) {
 
   const singleStoreMaxSavingsClp =
     winnerSingleStore && mostExpensiveComparable
-      ? Math.max(0, mostExpensiveComparable.totalClp - winnerSingleStore.totalClp)
+      ? Math.max(0, mostExpensiveComparable.netDiscountedTotalClp - winnerSingleStore.netDiscountedTotalClp)
       : 0;
 
   // Añadir diferencia vs el ganador a cada tienda del ranking
   for (const s of singleStoreRanking) {
-    s.diffVsWinnerClp = winnerSingleStore ? s.totalClp - winnerSingleStore.totalClp : 0;
+    s.diffVsWinnerClp = winnerSingleStore
+      ? s.netDiscountedTotalClp - winnerSingleStore.netDiscountedTotalClp
+      : 0;
     s.diffVsWinnerPct =
-      winnerSingleStore && winnerSingleStore.totalClp > 0
+      winnerSingleStore && winnerSingleStore.netDiscountedTotalClp > 0
         ? Number(
-            (((s.totalClp - winnerSingleStore.totalClp) / winnerSingleStore.totalClp) * 100).toFixed(1)
+            (
+              ((s.netDiscountedTotalClp - winnerSingleStore.netDiscountedTotalClp) /
+                winnerSingleStore.netDiscountedTotalClp) *
+              100
+            ).toFixed(1)
           )
         : 0;
   }
 
-  // 2. Carrito Óptimo Dividido (Cada producto donde es más barato)
+  // 2. Carrito Óptimo Dividido (Cada producto donde es más barato con descuentos aplicados)
   let splitTotalClp = 0;
+  let splitDiscountedTotalClp = 0;
   let splitFoundCount = 0;
   const splitByStore = {};
 
@@ -536,10 +607,18 @@ export function evaluateCart(cartRow) {
     if (offers.length === 0) continue;
 
     offers.sort((a, b) =>
-      compareByCartCriteria(a.product, b.product, a.lineTotal, b.lineTotal, criteria)
+      compareByCartCriteria(
+        a.product,
+        b.product,
+        a.discountedLineTotal ?? a.lineTotal,
+        b.discountedLineTotal ?? b.lineTotal,
+        criteria
+      )
     );
     const chosen = offers[0];
+    const lineCost = chosen.discountedLineTotal ?? chosen.lineTotal;
     splitTotalClp += chosen.lineTotal;
+    splitDiscountedTotalClp += lineCost;
     splitFoundCount++;
 
     if (!splitByStore[chosen.store]) {
@@ -547,19 +626,24 @@ export function evaluateCart(cartRow) {
         store: chosen.store,
         storeName: STORES[chosen.store]?.name || chosen.store,
         subtotalClp: 0,
+        discountedSubtotalClp: 0,
         items: [],
       };
     }
     splitByStore[chosen.store].subtotalClp += chosen.lineTotal;
+    splitByStore[chosen.store].discountedSubtotalClp += lineCost;
     splitByStore[chosen.store].items.push({
       itemId: item.id,
       label: item.label,
       quantity: item.quantity,
+      qty: chosen.qty || item.quantity,
       productName: chosen.product.name,
       brand: chosen.product.brand,
       formatLabel: chosen.product.formatLabel,
       unitPackagePrice: chosen.unitPackagePrice,
-      lineTotal: chosen.lineTotal,
+      lineTotal: lineCost,
+      grossLineTotal: chosen.lineTotal,
+      cardBadge: chosen.cardDiscount?.discountPct > 0 ? chosen.cardDiscount.label : null,
       unitPrice: chosen.product.unitPrice,
       unit: chosen.product.unit,
       pricePer10gProtein: chosen.product.pricePer10gProtein || null,
@@ -570,21 +654,28 @@ export function evaluateCart(cartRow) {
   // Despacho / Fricción por tienda en carrito dividido
   let splitTotalDeliveryFees = 0;
   for (const grp of Object.values(splitByStore)) {
+    const baseSub = grp.discountedSubtotalClp;
     const fee =
-      enableFriction && grp.subtotalClp < freeDeliveryThreshold ? deliveryCost : 0;
+      enableFriction && baseSub < freeDeliveryThreshold ? deliveryCost : 0;
     grp.deliveryFee = fee;
-    grp.netTotalClp = grp.subtotalClp + fee;
+    grp.deliveryGapClp =
+      enableFriction && baseSub < freeDeliveryThreshold ? freeDeliveryThreshold - baseSub : 0;
+    grp.deliveryProgressPct =
+      freeDeliveryThreshold > 0
+        ? Math.min(100, Math.round((baseSub / freeDeliveryThreshold) * 100))
+        : 100;
+    grp.netTotalClp = baseSub + fee;
     splitTotalDeliveryFees += fee;
   }
-  const splitNetTotalClp = splitTotalClp + splitTotalDeliveryFees;
+  const splitNetTotalClp = splitDiscountedTotalClp + splitTotalDeliveryFees;
 
   const splitSavingsVsBestSingleClp =
     winnerSingleStore && splitFoundCount === winnerSingleStore.foundCount
-      ? Math.max(0, winnerSingleStore.totalClp - splitTotalClp)
+      ? Math.max(0, winnerSingleStore.discountedTotalClp - splitDiscountedTotalClp)
       : 0;
 
-  // Veredicto de Costo Neto (considerando despachos)
-  const bestSingleNet = winnerSingleStore ? winnerSingleStore.netTotalClp : 0;
+  // Veredicto de Costo Neto (considerando dcto tarjetas + despachos)
+  const bestSingleNet = winnerSingleStore ? winnerSingleStore.netDiscountedTotalClp : 0;
   let frictionVerdict = "tie";
   let frictionVerdictMsg = "Ambas opciones tienen un costo neto similar.";
   let netSavingsClp = 0;
@@ -604,56 +695,156 @@ export function evaluateCart(cartRow) {
     }
   }
 
-  // 3. Mejor Combinación de Máximo 2 Supermercados (incluyendo costo de despacho por tienda)
+  // 3. Mejor Combinación de Máximo 2 Supermercados (con dcto tarjetas + rebalanceo inteligente de umbral envío gratis)
   let bestTwoCombo = null;
   const activeStoreIds = singleStoreRanking.map((s) => s.store);
   for (let i = 0; i < activeStoreIds.length; i++) {
     for (let j = i + 1; j < activeStoreIds.length; j++) {
       const sA = activeStoreIds[i];
       const sB = activeStoreIds[j];
-      let pairTotal = 0;
+
+      const baseAssigned = [];
       let subA = 0;
       let subB = 0;
       let pairFound = 0;
+
       for (const item of items) {
         const oA = item.storeOffers[sA];
         const oB = item.storeOffers[sB];
         if (!oA && !oB) continue;
         pairFound++;
-        if (oA && oB) {
-          if (oA.lineTotal <= oB.lineTotal) {
-            subA += oA.lineTotal;
-            pairTotal += oA.lineTotal;
-          } else {
-            subB += oB.lineTotal;
-            pairTotal += oB.lineTotal;
-          }
-        } else if (oA) {
-          subA += oA.lineTotal;
-          pairTotal += oA.lineTotal;
+        const costA = oA ? (oA.discountedLineTotal ?? oA.lineTotal) : Infinity;
+        const costB = oB ? (oB.discountedLineTotal ?? oB.lineTotal) : Infinity;
+        if (oA && (!oB || costA <= costB)) {
+          subA += costA;
+          baseAssigned.push({ item, side: "A", oA, oB, costA, costB });
         } else {
-          subB += oB.lineTotal;
-          pairTotal += oB.lineTotal;
+          subB += costB;
+          baseAssigned.push({ item, side: "B", oA, oB, costA, costB });
         }
       }
-      const feeA =
-        enableFriction && subA > 0 && subA < freeDeliveryThreshold ? deliveryCost : 0;
-      const feeB =
-        enableFriction && subB > 0 && subB < freeDeliveryThreshold ? deliveryCost : 0;
-      const deliveryFeesClp = feeA + feeB;
-      const netPairTotal = pairTotal + deliveryFeesClp;
+
+      const evalCombo = (assignedList) => {
+        let curSubA = 0;
+        let curSubB = 0;
+        for (const a of assignedList) {
+          if (a.side === "A") curSubA += a.costA;
+          else curSubB += a.costB;
+        }
+        const curFeeA =
+          enableFriction && curSubA > 0 && curSubA < freeDeliveryThreshold ? deliveryCost : 0;
+        const curFeeB =
+          enableFriction && curSubB > 0 && curSubB < freeDeliveryThreshold ? deliveryCost : 0;
+        return {
+          subA: curSubA,
+          subB: curSubB,
+          feeA: curFeeA,
+          feeB: curFeeB,
+          deliveryFeesClp: curFeeA + curFeeB,
+          netTotalClp: curSubA + curSubB + curFeeA + curFeeB,
+        };
+      };
+
+      const baseMetrics = evalCombo(baseAssigned);
+      let chosenMetrics = baseMetrics;
+      let rebalancedForFreeDelivery = false;
+      let deliverySavedClp = 0;
+      let movedItems = [];
+
+      if (enableFriction && deliveryCost > 0) {
+        for (const targetSide of ["A", "B"]) {
+          const curTargetSub = targetSide === "A" ? baseMetrics.subA : baseMetrics.subB;
+          if (curTargetSub <= 0 || curTargetSub >= freeDeliveryThreshold) continue;
+
+          const candidatesToMove = baseAssigned
+            .filter((entry) => entry.side !== targetSide && entry.oA && entry.oB)
+            .map((entry) => ({
+              entry,
+              delta:
+                targetSide === "A"
+                  ? entry.costA - entry.costB
+                  : entry.costB - entry.costA,
+              gainTarget: targetSide === "A" ? entry.costA : entry.costB,
+            }))
+            .sort((x, y) => x.delta - y.delta);
+
+          const cloned = baseAssigned.map((e) => ({ ...e }));
+          let runningSub = curTargetSub;
+          const movedNow = [];
+
+          for (const cand of candidatesToMove) {
+            if (runningSub >= freeDeliveryThreshold) break;
+            const targetEntry = cloned.find((c) => c.item.id === cand.entry.item.id);
+            if (!targetEntry) continue;
+            targetEntry.side = targetSide;
+            runningSub += cand.gainTarget;
+            movedNow.push(cand.entry.item.label);
+          }
+
+          if (runningSub >= freeDeliveryThreshold) {
+            const reMetrics = evalCombo(cloned);
+            if (
+              reMetrics.subA > 0 &&
+              reMetrics.subB > 0 &&
+              reMetrics.netTotalClp < chosenMetrics.netTotalClp
+            ) {
+              deliverySavedClp = Math.max(
+                0,
+                baseMetrics.deliveryFeesClp - reMetrics.deliveryFeesClp
+              );
+              chosenMetrics = reMetrics;
+              rebalancedForFreeDelivery = true;
+              movedItems = movedNow;
+            }
+          }
+        }
+      }
+
+      const gapA =
+        enableFriction && chosenMetrics.subA > 0 && chosenMetrics.subA < freeDeliveryThreshold
+          ? freeDeliveryThreshold - chosenMetrics.subA
+          : 0;
+      const gapB =
+        enableFriction && chosenMetrics.subB > 0 && chosenMetrics.subB < freeDeliveryThreshold
+          ? freeDeliveryThreshold - chosenMetrics.subB
+          : 0;
+      const progressPctA =
+        freeDeliveryThreshold > 0
+          ? Math.min(100, Math.round((chosenMetrics.subA / freeDeliveryThreshold) * 100))
+          : 100;
+      const progressPctB =
+        freeDeliveryThreshold > 0
+          ? Math.min(100, Math.round((chosenMetrics.subB / freeDeliveryThreshold) * 100))
+          : 100;
+
+      const pairSubtotal = chosenMetrics.subA + chosenMetrics.subB;
       if (
         !bestTwoCombo ||
         pairFound > bestTwoCombo.foundCount ||
-        (pairFound === bestTwoCombo.foundCount && netPairTotal < bestTwoCombo.netTotalClp)
+        (pairFound === bestTwoCombo.foundCount &&
+          chosenMetrics.netTotalClp < bestTwoCombo.netTotalClp)
       ) {
         bestTwoCombo = {
           stores: [sA, sB],
           storeNames: `${STORES[sA]?.name} + ${STORES[sB]?.name}`,
-          totalClp: pairTotal,
-          deliveryFeesClp,
-          netTotalClp: netPairTotal,
+          totalClp: pairSubtotal,
+          discountedTotalClp: pairSubtotal,
+          subA: chosenMetrics.subA,
+          subB: chosenMetrics.subB,
+          feeA: chosenMetrics.feeA,
+          feeB: chosenMetrics.feeB,
+          gapA,
+          gapB,
+          progressPctA,
+          progressPctB,
+          deliveryFeesClp: chosenMetrics.deliveryFeesClp,
+          netTotalClp: chosenMetrics.netTotalClp,
+          netDiscountedTotalClp: chosenMetrics.netTotalClp,
           foundCount: pairFound,
+          rebalancedForFreeDelivery,
+          deliverySavedClp,
+          movedItemsCount: movedItems.length,
+          movedItems,
         };
       }
     }
@@ -727,12 +918,15 @@ export function evaluateCart(cartRow) {
     cartNutritionSummary,
     optimalSplitCart: {
       totalClp: splitTotalClp,
+      discountedTotalClp: splitDiscountedTotalClp,
       deliveryFeesClp: splitTotalDeliveryFees,
       netTotalClp: splitNetTotalClp,
       foundCount: splitFoundCount,
       savingsVsBestSingleClp: splitSavingsVsBestSingleClp,
       storesUsedCount: Object.keys(splitByStore).length,
-      byStore: Object.values(splitByStore).sort((a, b) => b.subtotalClp - a.subtotalClp),
+      byStore: Object.values(splitByStore).sort(
+        (a, b) => (b.discountedSubtotalClp ?? b.subtotalClp) - (a.discountedSubtotalClp ?? a.subtotalClp)
+      ),
     },
   };
 }
@@ -937,6 +1131,149 @@ export async function refreshCartPrices(cartId) {
   );
 
   return getCartById(cartId);
+}
+
+/**
+ * Permite actualizar o reemplazar la oferta de Lider directamente en una fila
+ * del carrito (pegando texto, HTML o __NEXT_DATA__ de Lider.cl).
+ */
+export function updateCartItemLiderOffer(cartId, itemId, rawTextOrProduct) {
+  const row = db
+    .prepare("SELECT * FROM cart_items WHERE id = ? AND cart_id = ?")
+    .get(Number(itemId), Number(cartId));
+  if (!row) throw new Error("Ítem del carrito no encontrado");
+
+  const liderProducts =
+    typeof rawTextOrProduct === "string"
+      ? parseLiderRawInput(rawTextOrProduct)
+      : Array.isArray(rawTextOrProduct)
+      ? rawTextOrProduct
+      : rawTextOrProduct
+      ? [rawTextOrProduct]
+      : [];
+
+  if (liderProducts.length === 0) {
+    throw new Error("No se detectó ningún producto válido de Lider en el texto enviado.");
+  }
+
+  let parsed = {};
+  try {
+    parsed = JSON.parse(row.options_json || "{}");
+  } catch {
+    parsed = {};
+  }
+
+  parsed.candidatesByStore = parsed.candidatesByStore || {};
+  const mapped = liderProducts.slice(0, 6).map((p) => toCartCandidate(p, "lider"));
+  parsed.candidatesByStore.lider = mapped;
+  parsed.selectedByStore = parsed.selectedByStore || {};
+  parsed.selectedByStore.lider = String(mapped[0].externalId);
+
+  const now = new Date().toISOString();
+  db.prepare("UPDATE cart_items SET options_json = ? WHERE id = ?").run(
+    JSON.stringify(parsed),
+    Number(itemId)
+  );
+  db.prepare("UPDATE shopping_carts SET updated_at = ? WHERE id = ?").run(
+    now,
+    Number(cartId)
+  );
+
+  return {
+    cart: getCartById(cartId),
+    importedCount: mapped.length,
+    selectedName: mapped[0].name,
+  };
+}
+
+/**
+ * Importa un carrito completo extraído desde lider.cl/cart, crea el carrito en SuperPrecio CL
+ * y consulta automáticamente las alternativas en Jumbo, Santa Isabel, Unimarc y Tottus.
+ */
+export async function importCartFromLiderItems({
+  name = "🟦 Carrito importado de Lider",
+  items = [],
+  criteria = "unit_price",
+} = {}) {
+  const cleanItems = (items || []).filter((it) => it && it.name && it.price > 0);
+  if (cleanItems.length === 0) {
+    throw new Error("No hay productos válidos de Lider para crear el carrito.");
+  }
+
+  const cartId = createCart({ name, criteria });
+  const now = new Date().toISOString();
+  const capped = cleanItems.slice(0, 45);
+
+  const results = new Array(capped.length);
+  let cursor = 0;
+  const workerCount = Math.min(3, capped.length);
+
+  async function runWorker() {
+    while (cursor < capped.length) {
+      const idx = cursor++;
+      const lItem = capped[idx];
+      const spec = extractQuantityFromText(lItem.name, lItem.formatLabel || "");
+      const cleanQ = (lItem.searchQuery || lItem.name)
+        .replace(/\b\d+(?:[.,]\d+)?\s*(kg|g|gr|grs|ml|cc|l|lt|un|u)\b/gi, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      const queryToRun = cleanQ.length >= 3 ? cleanQ : lItem.name;
+      const prefUnit = lItem.unit || spec?.unit || "auto";
+
+      let candidatesByStore = {};
+      let targetUnit = prefUnit;
+      try {
+        const fetched = await fetchCandidatesForCartQuery(queryToRun, prefUnit);
+        candidatesByStore = fetched.candidatesByStore || {};
+        targetUnit = fetched.targetUnit || prefUnit;
+      } catch {
+        candidatesByStore = {};
+      }
+
+      const liderCand = toCartCandidate(lItem, "lider");
+      candidatesByStore.lider = [liderCand];
+      const selectedByStore = { lider: String(liderCand.externalId) };
+      const qty = Math.max(1, Number(lItem.cartQuantity || lItem.quantity) || 1);
+
+      results[idx] = {
+        label: lItem.name,
+        searchQuery: queryToRun,
+        quantity: qty,
+        preferredUnit: targetUnit,
+        optionsJson: JSON.stringify({ candidatesByStore, selectedByStore }),
+      };
+    }
+  }
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+  const insertStmt = db.prepare(
+    `INSERT INTO cart_items (cart_id, label, search_query, quantity, preferred_unit, options_json, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  for (const r of results) {
+    if (!r) continue;
+    insertStmt.run(
+      cartId,
+      r.label,
+      r.searchQuery,
+      r.quantity,
+      r.preferredUnit,
+      r.optionsJson,
+      now
+    );
+  }
+
+  db.prepare("UPDATE shopping_carts SET updated_at = ? WHERE id = ?").run(
+    new Date().toISOString(),
+    cartId
+  );
+
+  return {
+    cartId,
+    importedItemsCount: results.filter(Boolean).length,
+    cart: getCartById(cartId),
+  };
 }
 
 /**

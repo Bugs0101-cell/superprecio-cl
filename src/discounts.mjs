@@ -100,7 +100,8 @@ export const WEEKDAY_RULES = {
       program: "cmr",
       name: "Miércoles CMR Carnicería y Fiambrería",
       discountPct: 15,
-      description: "15% de descuento en carnes y fiambres con CMR.",
+      categories: ["carnes"],
+      description: "15% de descuento solo en carnes y fiambres con CMR.",
     },
   ],
   4: [ // Jueves
@@ -175,6 +176,7 @@ export function calculateDiscountedPricing({
   store,
   price,
   memberPrice,
+  category = null,
   activePrograms = ["cmr", "cencosud", "unimarc_club", "lider_bci"],
   dayOfWeek = getTodayDayIndex(),
 }) {
@@ -196,21 +198,39 @@ export function calculateDiscountedPricing({
     }
   }
 
-  // 2. Descuentos por Calendario del Día
+  // 2. Descuentos por Calendario del Día (respetando restricción por categoría si la regla la tiene)
   const dayRules = WEEKDAY_RULES[dayOfWeek] || [];
+  let bestAfterRule = effectivePrice;
+  let bestRuleLabel = null;
   for (const rule of dayRules) {
-    if (rule.store === store && activeSet.has(rule.program)) {
-      const discountAmount = Math.round((effectivePrice * rule.discountPct) / 100);
-      effectivePrice = Math.max(1, effectivePrice - discountAmount);
-      appliedDiscounts.push(`${rule.name} (-${rule.discountPct}%)`);
-      break; // Aplicar el mejor descuento del día
+    if (rule.store !== store || !activeSet.has(rule.program)) continue;
+    if (
+      Array.isArray(rule.categories) &&
+      (!category || !rule.categories.includes(category))
+    ) {
+      continue;
+    }
+    const discountAmount = Math.round((effectivePrice * rule.discountPct) / 100);
+    const candidatePrice = Math.max(1, effectivePrice - discountAmount);
+    if (candidatePrice < bestAfterRule) {
+      bestAfterRule = candidatePrice;
+      bestRuleLabel = `${rule.name} (-${rule.discountPct}%)`;
     }
   }
+  if (bestRuleLabel) {
+    effectivePrice = bestAfterRule;
+    appliedDiscounts.push(bestRuleLabel);
+  }
+
+  const savingsAmount = Math.max(0, price - effectivePrice);
+  const discountPct = price > 0 ? Math.round((savingsAmount / price) * 100) : 0;
 
   return {
     originalPrice: price,
     finalPrice: effectivePrice,
-    savingsAmount: Math.max(0, price - effectivePrice),
+    savingsAmount,
+    discountPct,
+    label: appliedDiscounts.join(" + "),
     hasDiscount: effectivePrice < price,
     appliedDiscounts,
   };

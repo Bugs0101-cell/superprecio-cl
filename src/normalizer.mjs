@@ -153,9 +153,8 @@ export function buildCrossStoreSearchQuery(rawQuery = "") {
   return q || String(rawQuery).trim();
 }
 
-export function extractQuantityFromText(name = "", formatStr = "") {
-  const combined = `${name} ${formatStr}`.trim();
-  const norm = normalizeText(combined)
+function cleanTextForQuantity(text = "") {
+  return normalizeText(text)
     .replace(
       /\b(?:rinde|para\s+preparar|prepara|equivalente\s+a)\s*\d+(?:[.,]\d+)?\s*(?:lt|lts|l|litro|litros|ml|cc)\b/gi,
       " "
@@ -163,8 +162,12 @@ export function extractQuantityFromText(name = "", formatStr = "") {
     .replace(/\b\d+\s*porciones?\b/gi, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
 
-  // 1. Multipacks con peso/volumen: ej. "6 x 200 ml", "12 un de 90 g", "6x1.5 l"
+function parseSingleQuantityText(norm) {
+  if (!norm) return null;
+
+  // 1. Multipacks con peso/volumen explícito: ej. "6 x 200 ml", "12 un de 90 g", "15 Un de 30 g"
   const multiMatch = norm.match(
     /\b(\d{1,3})\s*(?:un(?:id(?:ades)?)?\s*)?(?:x|de|por)\s*(\d+(?:[.,]\d+)?)\s*(kg|kilo|kilos|g|gr|grs|gramos|lt|lts|l|litro|litros|ml|cc)\b/i
   );
@@ -184,14 +187,17 @@ export function extractQuantityFromText(name = "", formatStr = "") {
   }
 
   // 1b. Multipacks separados por texto: ej. "Pack 6 un. Leche Soprole Proteína Chocolate 200 ml"
+  // Nunca aplicar si antes ya venía un peso explícito (ej. "Churrasco 90 g 3 un.")
   const separatedPackMatch = norm.match(
-    /\b(?:pack\s*)?(\d{1,2})\s*(?:un(?:id(?:ades)?)?\.?|x)\b.*?\b(\d+(?:[.,]\d+)?)\s*(ml|cc|g|gr|grs)\b/i
+    /\b(?:pack\s*)?(\d{1,2})\s*(?:un(?:id(?:ades)?)?\.?|x)\b(.*?)\b(\d+(?:[.,]\d+)?)\s*(ml|cc|g|gr|grs)\b/i
   );
   if (separatedPackMatch) {
+    const prefix = norm.slice(0, separatedPackMatch.index || 0);
+    const hasPriorWeight = /\b\d+(?:[.,]\d+)?\s*(kg|kilo|kilos|g|gr|grs|ml|cc|lt|l)\b/i.test(prefix);
     const count = Number(separatedPackMatch[1]);
-    const eachQty = Number(separatedPackMatch[2].replace(",", "."));
-    const rawUnit = separatedPackMatch[3];
-    if (count >= 2 && count <= 30 && eachQty >= 15 && eachQty <= 1500) {
+    const eachQty = Number(separatedPackMatch[3].replace(",", "."));
+    const rawUnit = separatedPackMatch[4];
+    if (!hasPriorWeight && count >= 2 && count <= 30 && eachQty >= 15 && eachQty <= 1500) {
       const totalRaw = count * eachQty;
       const converted = normalizeUnitPrice(1000, totalRaw, rawUnit);
       return {
@@ -211,7 +217,6 @@ export function extractQuantityFromText(name = "", formatStr = "") {
     const rawUnit = singleMatch[2];
     if (qty > 0) {
       const converted = normalizeUnitPrice(1000, qty, rawUnit);
-      // Evitar falsos positivos absurdos (ej. "0.0001 kg")
       if (converted.baseAmount > 0 && converted.baseAmount <= 100) {
         return {
           baseAmount: converted.baseAmount,
@@ -237,6 +242,16 @@ export function extractQuantityFromText(name = "", formatStr = "") {
       };
     }
   }
+
+  return null;
+}
+
+export function extractQuantityFromText(name = "", formatStr = "") {
+  const fromName = parseSingleQuantityText(cleanTextForQuantity(name));
+  if (fromName) return fromName;
+
+  const fromFmt = parseSingleQuantityText(cleanTextForQuantity(formatStr));
+  if (fromFmt) return fromFmt;
 
   return null;
 }
@@ -846,21 +861,88 @@ function resolveNutritionProfile(norm, unit, brandNorm) {
   return null;
 }
 
-export function estimateNutritionMetrics(name = "", unit = "un", baseAmount = 1, price = 0, brand = "") {
+export function inferProductCategory(name = "") {
+  const norm = normalizeText(name);
+  if (
+    /\b(pollo|pechuga|filete|truto|vacuno|churrasco|molida|posta|lomo|cerdo|pavo|jamon|salmon|atun|jurel|merluza|reineta|vienesa|salchicha|hamburguesa|carne)\b/.test(
+      norm
+    )
+  ) {
+    return "carnes";
+  }
+  if (
+    /\b(leche|leches|yoghurt|yogurt|yogur|queso|quesillo|cottage|mantequilla|margarina|crema|huevo|huevos|skyr)\b/.test(
+      norm
+    )
+  ) {
+    return "lacteos";
+  }
+  if (
+    /\b(detergente|lavaloza|lavalozas|limpiador|cloro|clorinda|clorox|quitamanchas|escobillon|papel\s+higienico|higienico|toalla\s+de\s+papel|servilleta|bolsa\s+de\s+basura|basura|suavizante|desinfectante)\b/.test(
+      norm
+    )
+  ) {
+    return "aseo";
+  }
+  if (
+    /\b(jugo|refresco|nectar|bebida|gaseosa|coca|pepsi|fanta|sprite|agua|limonada|te|cafe|yerba|mate|zuko|livean|sprim)\b/.test(
+      norm
+    )
+  ) {
+    return "bebidas";
+  }
+  if (
+    /\b(papas\s+duquesa|duquesa|sofrito|fruta|verdura|tomate|palta|cebolla|papa|lechuga|limon|manzana|platano|arveja|choclo|brocoli)\b/.test(
+      norm
+    )
+  ) {
+    return "frutas_verduras";
+  }
+  return "despensa";
+}
+
+export function extractNutritionalSeals(name = "", description = "") {
+  const norm = normalizeText(`${name} ${description}`);
+  const seals = [];
+  if (/\b(?:alto\s+en\s+sodio)\b/.test(norm)) seals.push("⚠️ Alto en Sodio");
+  if (/\b(?:alto\s+en\s+azucares?)\b/.test(norm)) seals.push("⚠️ Alto en Azúcares");
+  if (/\b(?:alto\s+en\s+grasas?\s+saturadas?)\b/.test(norm)) seals.push("⚠️ Alto en Grasas Sat.");
+  if (/\b(?:alto\s+en\s+calorias)\b/.test(norm)) seals.push("⚠️ Alto en Calorías");
+  if (/\b(?:libre\s+de\s+sellos|sin\s+sellos|0\s+sellos)\b/.test(norm)) seals.push("✅ Sin Sellos");
+  if (/\b(?:sin\s+azucar|0%\s*azucar|cero\s+azucar|sin\s+azucar\s+anadida)\b/.test(norm))
+    seals.push("🌿 Sin Azúcar Añadida");
+  if (/\b(?:sin\s+lactosa|deslactosad[oa]|zerolacto)\b/.test(norm)) seals.push("🥛 Sin Lactosa");
+  if (/\b(?:descremad[oa]|0%\s*grasa)\b/.test(norm)) seals.push("🪶 Descremada");
+  if (/\b(?:integral|100%\s*grano\s+entero)\b/.test(norm)) seals.push("🌾 Integral");
+  return seals;
+}
+
+export function estimateNutritionMetrics(
+  name = "",
+  unit = "un",
+  baseAmount = 1,
+  price = 0,
+  brand = "",
+  description = ""
+) {
   const norm = normalizeText(name);
   const brandNorm = normalizeText(brand);
   const matched = resolveNutritionProfile(norm, unit, brandNorm);
+  const nutritionSeals = extractNutritionalSeals(name, description);
+  const inferredCategory = inferProductCategory(name);
 
   if (!matched) {
     return {
       hasProteinData: false,
-      hasNutritionData: false,
+      hasNutritionData: nutritionSeals.length > 0,
       proteinGramsTotal: null,
       proteinPer100g: null,
       pricePer10gProtein: null,
       nutritionScore: null,
       nutritionGrade: null,
       nutritionBadge: null,
+      nutritionSeals,
+      inferredCategory,
     };
   }
 
@@ -874,6 +956,8 @@ export function estimateNutritionMetrics(name = "", unit = "un", baseAmount = 1,
       nutritionScore: matched.score,
       nutritionGrade: matched.grade,
       nutritionBadge: matched.badge,
+      nutritionSeals,
+      inferredCategory,
     };
   }
 
@@ -908,11 +992,20 @@ export function estimateNutritionMetrics(name = "", unit = "un", baseAmount = 1,
     nutritionScore: matched.score,
     nutritionGrade: matched.grade,
     nutritionBadge: matched.badge,
+    nutritionSeals,
+    inferredCategory,
   };
 }
 
-export function estimateProteinMetrics(name = "", unit = "un", baseAmount = 1, price = 0, brand = "") {
-  return estimateNutritionMetrics(name, unit, baseAmount, price, brand);
+export function estimateProteinMetrics(
+  name = "",
+  unit = "un",
+  baseAmount = 1,
+  price = 0,
+  brand = "",
+  description = ""
+) {
+  return estimateNutritionMetrics(name, unit, baseAmount, price, brand, description);
 }
 
 // --- Detector de Falsos Packs Ahorro (Envases Trampa) ---
