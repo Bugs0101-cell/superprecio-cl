@@ -361,7 +361,8 @@
         <div id="cartStrategiesGrid" class="cart-strategies-grid"></div>
 
         <!-- Ranking de todos los supermercados (Todo en 1 lugar) -->
-        <h4 style="margin: 1.35rem 0 0.75rem;">📊 Ranking Comprando Todo en un Solo Supermercado</h4>
+        <h4 style="margin: 1.35rem 0 0.75rem;">📊 Ranking Visual Comprando Todo en un Solo Supermercado (Neto Post-Descuentos + Envío)</h4>
+        <div id="cartComparisonBarsBox" class="cart-bars-panel" style="margin-bottom: 1rem;"></div>
         <div id="basketSummaryCards" class="basket-stores-grid"></div>
         <div id="cartNutritionSummaryBox" style="margin-top: 1.25rem;"></div>
       </div>
@@ -393,10 +394,16 @@
         </div>
       </div>
 
-      <!-- Desglose de Compra Óptima Dividida por Supermercado -->
+      <!-- Desglose de Compra Óptima Dividida por Supermercado (Checklist Modo Pasillo) -->
       <div class="card" style="margin-top: 1rem;">
-        <h3>🛍️ Hoja de Ruta: Compra Inteligente Dividida por Supermercado</h3>
-        <p class="small-muted">Si decides comprar cada producto en el supermercado donde es más barato, aquí tienes tu lista separada por tienda con links directos:</p>
+        <div class="panel-header-bar" style="margin-bottom: 0.5rem;">
+          <div>
+            <h3>🛍️ Hoja de Ruta y Checklist de Súper (Modo Pasillo)</h3>
+            <p class="small-muted">Marca los productos a medida que los echas al carro real para controlar lo que llevas comprado y el monto restante:</p>
+          </div>
+          <button type="button" class="btn btn-secondary btn-sm" id="btnResetChecklist">↺ Reiniciar Checklist</button>
+        </div>
+        <div id="roadmapProgressBarBox" class="roadmap-progress-wrap" style="margin-top: 0.75rem;"></div>
         <div id="splitCartRoadmapGrid" class="split-roadmap-grid" style="margin-top: 1rem;"></div>
       </div>
     </section>
@@ -576,8 +583,14 @@
         </div>
 
         <div style="margin-top: 1.5rem;">
+          <h4>📦 Inflación por Categoría (Comparativa Visual)</h4>
+          <div id="ipcCategoryBreakdownBox" style="margin-top: 0.65rem;"></div>
+        </div>
+
+        <div style="margin-top: 1.5rem;">
           <h4>🏪 Inflación Registrada por Cadena de Supermercado</h4>
-          <div class="table-responsive" style="margin-top: 0.5rem;">
+          <div id="ipcStoreBarsBox" style="margin-top: 0.65rem;"></div>
+          <div class="table-responsive" style="margin-top: 0.85rem;">
             <table class="data-table" id="ipcStoreTable">
               <thead>
                 <tr>
@@ -617,17 +630,59 @@
               🛒 Importar a SuperPrecio CL
             </a>
             <span class="small-muted">⬅️ <strong>Arrastra este botón a tu barra de favoritos de Chrome/Edge (Ctrl + Shift + B)</strong></span>
+            <button
+              type="button"
+              class="btn btn-secondary btn-sm"
+              id="btnRotateBookmarkletToken"
+              title="Genera un token nuevo e invalida marcadores anteriores"
+              style="margin-left: auto;"
+            >
+              🔄 Rotar Token (<span id="bookmarkletTokenVer">v1</span>)
+            </button>
           </div>
 
           <div class="bookmarklet-instructions">
             <h4>¿Cómo se usa? (Apuntando automáticamente a <code id="bookmarkletOriginCode">este servidor</code>)</h4>
             <ol>
-              <li>Arrastra el botón verde de arriba a tu barra de marcadores de Chrome o Edge.</li>
-              <li>Abre <code>super.lider.cl</code> (o cualquier búsqueda en el súper) normalmente en tu navegador.</li>
+              <li>Arrastra el botón verde de arriba a tu barra de marcadores de Chrome o Edge (o vuelve a arrastrarlo si actualizaste la app).</li>
+              <li>Abre <code>www.lider.cl/cart</code> (para importar tu <strong>carrito completo de 1 clic</strong>), una búsqueda en Lider o una ficha de producto <code>/ip/</code>.</li>
               <li>Haz clic en el marcador <strong>"🛒 Importar a SuperPrecio CL"</strong> en tu barra de favoritos.</li>
-              <li>¡Listo! Los productos y precios se enviarán automáticamente a este comparador (incluso si está en la nube por HTTPS) y quedarán guardados en tu base de datos.</li>
+              <li>¡Listo! En modo carrito creará un Carrito Comparativo en Tab 2 cotizando tus mismos productos y cantidades en Jumbo, Santa Isabel, Unimarc y Tottus.</li>
             </ol>
           </div>
+
+          <details class="lider-paste-details" style="margin-top: 0.9rem;">
+            <summary>📋 <strong>Plan B Manual: Pegar contenido/JSON/Markdown de Lider.cl (Búsqueda o /cart)</strong></summary>
+            <div class="stack-form" style="margin-top: 0.75rem;">
+              <div class="form-row-2">
+                <div class="form-field">
+                  <label>Nombre si importas un carrito completo:</label>
+                  <input type="text" id="liderCartNameInput" placeholder="Ej: Carrito Lider Octubre" />
+                </div>
+                <div class="form-field">
+                  <label>Modo de importación:</label>
+                  <select id="liderImportModeSelect">
+                    <option value="auto">Automático (detecta si es Carrito /cart o Búsqueda)</option>
+                    <option value="cart">Crear Carrito Comparativo Completo (Tab 2)</option>
+                    <option value="tracked">Actualizar Productos Seguidos (Tab 1)</option>
+                  </select>
+                </div>
+              </div>
+              <div class="form-field">
+                <textarea
+                  id="liderRawTextarea"
+                  rows="4"
+                  placeholder="Pega aquí texto copiado de lider.cl/cart, HTML con __NEXT_DATA__, o JSON del carrito..."
+                ></textarea>
+              </div>
+              <div style="display:flex; gap:0.75rem; align-items:center;">
+                <button type="button" class="btn btn-primary btn-sm" id="btnImportLiderRaw">
+                  🟦 Procesar e Importar Contenido de Lider
+                </button>
+                <span id="liderImportResultBox" class="small-muted"></span>
+              </div>
+            </div>
+          </details>
         </div>
       </div>
 
@@ -635,19 +690,22 @@
       <div class="card" style="margin-bottom: 1.25rem;">
         <div class="panel-header-bar">
           <div>
-            <h2>🔔 Alertas Push en Telegram (Pisos Históricos y Rebajas)</h2>
-            <p>Recibe un mensaje en tu celular vía Telegram cuando el programador automático detecte que un producto que te interesa bajó de precio o alcanzó su <strong>Piso Histórico (🟢)</strong>.</p>
+            <h2>🔔 Alertas Push en Telegram (Pisos Históricos, Objetivos y Carrito)</h2>
+            <p>Recibe un mensaje en tu celular vía Telegram cuando un producto baje al porcentaje umbral, alcance tu <strong>Precio Objetivo ($)</strong> o un carrito baje de tu presupuesto.</p>
           </div>
         </div>
 
         <form id="telegramSettingsForm" class="stack-form">
           <div class="form-row-2">
             <div class="form-field">
-              <label>Telegram Bot Token (obtenido de @BotFather):</label>
+              <label>
+                Telegram Bot Token (@BotFather):
+                <span id="teleTokenStatusBadge" class="badge-pill badge-neutral" style="display:none; margin-left:0.4rem;">🔐 Guardado</span>
+              </label>
               <input type="text" id="teleTokenInput" placeholder="Ej: 123456789:ABCdefGHIjklMNOpqrSTUvwxYZ" />
             </div>
             <div class="form-field">
-              <label>Chat ID (obtenido de @userinfobot):</label>
+              <label>Chat ID (@userinfobot):</label>
               <input type="text" id="teleChatIdInput" placeholder="Ej: 987654321" />
             </div>
           </div>
@@ -655,15 +713,21 @@
           <div class="form-row-2" style="align-items: center;">
             <div class="form-field">
               <label>Umbral de rebaja para alertar (%):</label>
-              <input type="number" id="teleThresholdInput" value="12" min="5" max="50" style="width: 120px;" />
-              <small class="small-muted">Te avisará si el precio baja este porcentaje o más.</small>
+              <input type="number" id="teleThresholdInput" value="12" min="3" max="60" style="width: 120px;" />
+              <small class="small-muted">Te avisará si el precio baja este porcentaje o más respecto a la medición anterior.</small>
             </div>
             <div class="form-field">
-              <label class="checkbox-label" style="margin-top: 1.2rem;">
-                <input type="checkbox" id="teleEnabledInput" />
-                <span><strong>Activar Alertas Automáticas por Telegram</strong></span>
-              </label>
+              <label>Alerta si un Carrito Neto baja de (CLP, 0 = desactivado):</label>
+              <input type="number" id="teleCartTargetInput" value="0" min="0" step="1000" placeholder="Ej: 45000" style="width: 160px;" />
+              <small class="small-muted">Avisa si el total neto del mejor supermercado es ≤ este monto.</small>
             </div>
+          </div>
+
+          <div class="form-field">
+            <label class="checkbox-label">
+              <input type="checkbox" id="teleEnabledInput" />
+              <span><strong>Activar Alertas Automáticas por Telegram</strong></span>
+            </label>
           </div>
 
           <div style="display:flex; gap:0.75rem; margin-top:0.5rem;">
@@ -839,11 +903,96 @@
             </select>
           </div>
         </div>
+        <div class="form-field">
+          <label>Precio Objetivo para Alerta Telegram (CLP, opcional):</label>
+          <input type="number" id="newTrackTargetPrice" min="0" step="50" placeholder="Ej: 1800 (te avisa si el paquete o $/u baja a este valor o menos)" />
+        </div>
         <div class="modal-footer">
           <button type="button" class="btn btn-secondary" id="btnCancelNewTrack">Cancelar</button>
           <button type="submit" class="btn btn-primary" id="btnSubmitNewTrack">
             🚀 Crear y Consultar Precios Ahora
           </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: EDITAR PRODUCTO EN SEGUIMIENTO -->
+  <div id="modalEditTracked" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>✏️ Editar Seguimiento y Precio Objetivo</h3>
+        <button type="button" class="modal-close" id="btnCloseEditTrackModal">&times;</button>
+      </div>
+      <form id="formEditTracked" class="stack-form">
+        <input type="hidden" id="editTrackId" />
+        <div class="form-field">
+          <label>Nombre descriptivo del producto:</label>
+          <input type="text" id="editTrackTitle" required />
+        </div>
+        <div class="form-field">
+          <label>Término de búsqueda automática:</label>
+          <input type="text" id="editTrackQuery" required />
+        </div>
+        <div class="form-row-2">
+          <div class="form-field">
+            <label>Unidad principal:</label>
+            <select id="editTrackUnit">
+              <option value="auto">Automática</option>
+              <option value="kg">Por Kilo / Gramos (kg)</option>
+              <option value="lt">Por Litro / Mililitros (L)</option>
+              <option value="un">Por Unidad (un)</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label>Categoría:</label>
+            <select id="editTrackCategory">
+              <option value="Despensa">Despensa</option>
+              <option value="Lácteos">Lácteos y Huevos</option>
+              <option value="Carnes">Carnes y Pescados</option>
+              <option value="Frutas y Verduras">Frutas y Verduras</option>
+              <option value="Bebidas">Bebidas y Líquidos</option>
+              <option value="Aseo y Limpieza">Aseo y Limpieza</option>
+              <option value="Cuidado Personal">Cuidado Personal</option>
+              <option value="Otros">Otros</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-field">
+          <label>Precio Objetivo Telegram (CLP, dejar vacío o 0 para desactivar):</label>
+          <input type="number" id="editTrackTargetPrice" min="0" step="50" placeholder="Ej: 1850" />
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btnCancelEditTrack">Cancelar</button>
+          <button type="submit" class="btn btn-primary" id="btnSubmitEditTrack">💾 Guardar Cambios</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- MODAL: ACTUALIZAR OFERTA DE LIDER EN FILA DEL CARRITO -->
+  <div id="modalCartLiderUpdate" class="modal-backdrop" style="display: none;">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>🟦 Actualizar Precio de Lider en Carrito</h3>
+        <button type="button" class="modal-close" id="btnCloseCartLiderModal">&times;</button>
+      </div>
+      <form id="formCartLiderUpdate" class="stack-form">
+        <input type="hidden" id="cartLiderCartId" />
+        <input type="hidden" id="cartLiderItemId" />
+        <p class="small-muted">Ítem: <strong id="cartLiderItemLabel">—</strong></p>
+        <div class="form-field">
+          <label>Pega texto, URL o JSON copiado de Lider.cl para este producto:</label>
+          <textarea
+            id="cartLiderRawInput"
+            rows="4"
+            placeholder="Pega aquí la ficha de producto, resultado de búsqueda o Markdown de Lider.cl..."
+            required
+          ></textarea>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" id="btnCancelCartLiderModal">Cancelar</button>
+          <button type="submit" class="btn btn-primary" id="btnSubmitCartLider">🟦 Guardar Oferta Lider</button>
         </div>
       </form>
     </div>

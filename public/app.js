@@ -38,6 +38,56 @@ function fmtClp(num) {
   return "$" + Math.round(Number(num)).toLocaleString("es-CL");
 }
 
+function renderNutritionSealsHtml(seals = []) {
+  if (!Array.isArray(seals) || seals.length === 0) return "";
+  return `<div class="seals-row">${seals
+    .slice(0, 4)
+    .map((s) => {
+      const isWarning = /alto\s+en/i.test(s);
+      return `<span class="seal-pill ${isWarning ? "seal-warning" : "seal-healthy"}">${s}</span>`;
+    })
+    .join("")}</div>`;
+}
+
+function getCartChecklistSet(cartId) {
+  try {
+    const raw = localStorage.getItem(`sp_checklist_${cartId}`);
+    const arr = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveCartChecklistSet(cartId, set) {
+  try {
+    localStorage.setItem(`sp_checklist_${cartId}`, JSON.stringify([...set]));
+  } catch {}
+}
+
+function openEditTrackedModal(item) {
+  const modal = document.getElementById("modalEditTracked");
+  if (!modal || !item) return;
+  document.getElementById("editTrackId").value = String(item.id);
+  document.getElementById("editTrackTitle").value = item.title || "";
+  document.getElementById("editTrackQuery").value = item.search_query || "";
+  document.getElementById("editTrackUnit").value = item.preferred_unit || "auto";
+  document.getElementById("editTrackCategory").value = item.category || "Despensa";
+  document.getElementById("editTrackTargetPrice").value =
+    item.target_price_clp > 0 ? String(item.target_price_clp) : "";
+  modal.style.display = "flex";
+}
+
+function openCartLiderUpdateModal(cartId, itemId, label) {
+  const modal = document.getElementById("modalCartLiderUpdate");
+  if (!modal) return;
+  document.getElementById("cartLiderCartId").value = String(cartId);
+  document.getElementById("cartLiderItemId").value = String(itemId);
+  document.getElementById("cartLiderItemLabel").textContent = label || "Producto";
+  document.getElementById("cartLiderRawInput").value = "";
+  modal.style.display = "flex";
+}
+
 function fmtUnitScaled(unitPrice, unit, scale = state.unitScale, proteinPrice = null) {
   if (scale === "protein") {
     if (proteinPrice && Number.isFinite(Number(proteinPrice))) {
@@ -334,6 +384,11 @@ function renderTrackedCards() {
 
       const latestMap = item.latestByStore || {};
       const varMap = item.variabilityByStore || {};
+      const activeSnaps = Object.values(latestMap);
+      const maxStoreUnitPrice =
+        activeSnaps.length > 0
+          ? Math.max(...activeSnaps.map((s) => Number(s.unit_price) || 1))
+          : 1;
 
       const storeRowsHtml = STORE_ORDER.map((storeId) => {
         const snap = latestMap[storeId];
@@ -356,6 +411,41 @@ function renderTrackedCards() {
           ? `Mín: ${fmtUnitScaled(vStat.minUnitPrice, snap.unit, state.unitScale)} · Máx: ${fmtUnitScaled(vStat.maxUnitPrice, snap.unit, state.unitScale)}`
           : "";
 
+        const relWidthPct =
+          maxStoreUnitPrice > 0
+            ? Math.max(12, Math.min(100, Math.round((snap.unit_price / maxStoreUnitPrice) * 100)))
+            : 100;
+        const vsBest = Number(snap.vs_best_pct || 0);
+        const relClass = vsBest === 0 ? "is-best" : vsBest <= 20 ? "is-mid" : "is-high";
+        const relLabel = vsBest === 0 ? "🏆 Mín. hoy" : `+${vsBest}%`;
+
+        const showThermo = vStat && vStat.observations >= 2 && vStat.maxUnitPrice > vStat.minUnitPrice;
+        const thermoPct = Math.max(4, Math.min(96, Number(snap.price_range_pct ?? 50)));
+
+        const barsHtml = `
+          <div class="store-row-bars">
+            <div class="price-rel-row" title="Comparativa porcentual frente al supermercado más económico de esta tarjeta">
+              <div class="price-rel-track">
+                <div class="price-rel-fill ${relClass}" style="width: ${relWidthPct}%;"></div>
+              </div>
+              <span style="min-width: 58px; text-align:right; font-weight:700; color:${
+                vsBest === 0 ? "#34d399" : vsBest <= 20 ? "#fbbf24" : "#f87171"
+              };">${relLabel}</span>
+            </div>
+            ${
+              showThermo
+                ? `<div class="range-thermometer" title="Posición actual respecto a Mínimo y Máximo histórico registrado">
+                    <span>Mín</span>
+                    <div class="range-thermo-track">
+                      <span class="range-thermo-dot" style="left: ${thermoPct}%;"></span>
+                    </div>
+                    <span>Máx</span>
+                  </div>`
+                : ""
+            }
+          </div>
+        `;
+
         const signalBadge = snap.signalLabel
           ? `<span class="signal-pill signal-${snap.signal || "normal"}" title="${snap.signalExplanation || ""}">${snap.signalLabel}</span>`
           : "";
@@ -367,6 +457,8 @@ function renderTrackedCards() {
         const nutritionTag = snap.nutrition_badge
           ? `<span class="nutrition-badge ${gradeClass}" title="Calidad y perfil nutricional">${snap.nutrition_badge}</span>`
           : "";
+
+        const sealsHtml = renderNutritionSealsHtml(snap.nutrition_seals);
 
         const proteinTag = snap.protein_price
           ? `<span class="protein-tag" title="Precio por cada 10g de proteína real">🥩 ${fmtClp(snap.protein_price)}/10g prot${snap.protein_grams_total ? ` (${snap.protein_grams_total}g tot.)` : ""}</span>`
@@ -428,6 +520,8 @@ function renderTrackedCards() {
                 ${signalBadge}
                 <span>${minMaxText}</span>
               </div>
+              ${sealsHtml}
+              ${barsHtml}
             </div>
             <div class="store-row-prices">
               <div class="unit-price-main">
@@ -500,18 +594,41 @@ function renderTrackedCards() {
         )
         .join("");
 
-      const pinnedCount = (item.pinnedProducts || []).length;
+      const pinnedList = item.pinnedProducts || [];
+      const pinnedCount = pinnedList.length;
+      const pinnedChipsHtml =
+        pinnedCount > 0
+          ? `<div class="pinned-chips-row">
+              ${pinnedList
+                .map(
+                  (p) => `<span class="pinned-chip" title="Producto fijado manualmente en ${STORE_META[p.store]?.name || p.store}">
+                    <span>📌 ${STORE_META[p.store]?.name || p.store}:</span>
+                    <span class="pinned-chip-name">${p.name}</span>
+                    <button type="button" class="btn-unpin-chip" data-pinned-id="${p.id}" title="Desfijar producto">&times;</button>
+                  </span>`
+                )
+                .join("")}
+            </div>`
+          : "";
 
       return `
         <article class="tracked-card">
           <div class="tracked-card-top">
             <div>
-              <span class="category-pill">${item.category || "Despensa"}</span>
+              <div style="display:flex; align-items:center; gap:0.4rem; flex-wrap:wrap;">
+                <span class="category-pill">${item.category || "Despensa"}</span>
+                ${
+                  item.target_price_clp > 0
+                    ? `<span class="target-price-pill" title="Alerta Telegram si el precio llega a este monto o menos">🎯 Obj: ${fmtClp(item.target_price_clp)}</span>`
+                    : ""
+                }
+              </div>
               <div class="tracked-card-title">${item.title}</div>
               <div class="tracked-query-sub">
                 🔍 Búsqueda auto: <code>${item.search_query || "Solo fijados"}</code>
                 ${pinnedCount > 0 ? ` · 📌 ${pinnedCount} fijado(s)` : ""}
               </div>
+              ${pinnedChipsHtml}
               <div class="card-mode-pills">
                 <button type="button" class="card-mode-pill ${cardMode === "unit" ? "active" : ""}" data-item-id="${item.id}" data-mode="unit">💲 $/kg·L</button>
                 <button type="button" class="card-mode-pill ${cardMode === "effective" ? "active" : ""}" data-item-id="${item.id}" data-mode="effective">🏷️ c/ Promo 2x</button>
@@ -520,12 +637,15 @@ function renderTrackedCards() {
                 <button type="button" class="card-mode-pill ${cardMode === "nutrition" ? "active" : ""}" data-item-id="${item.id}" data-mode="nutrition">🧬 Nutrición</button>
               </div>
             </div>
-            <div style="display:flex; gap:0.4rem;">
+            <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
               <button class="btn btn-accent btn-sm btn-add-tracked-to-cart" data-id="${item.id}" title="Añadir al Carrito de Compra">
                 🛒 + Al Carrito
               </button>
               <button class="btn btn-secondary btn-sm btn-view-history" data-id="${item.id}" title="Ver curva histórica de variabilidad">
                 📈 Historial (${item.totalSnapshots})
+              </button>
+              <button class="btn btn-secondary btn-sm btn-edit-one" data-id="${item.id}" title="Editar título, búsqueda o precio objetivo">
+                ✏️
               </button>
               <button class="btn btn-secondary btn-sm btn-refresh-one" data-id="${item.id}" title="Consultar precios en vivo ahora">
                 🔄
@@ -559,6 +679,30 @@ function renderTrackedCards() {
       const itemId = Number(btn.dataset.itemId);
       state.cardSortByItemId[itemId] = btn.dataset.mode;
       renderTrackedCards();
+    });
+  });
+
+  grid.querySelectorAll(".btn-edit-one").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const item = state.trackedItems.find((i) => i.id === Number(btn.dataset.id));
+      openEditTrackedModal(item);
+    });
+  });
+
+  grid.querySelectorAll(".btn-unpin-chip").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const pinnedId = Number(btn.dataset.pinnedId);
+      if (!pinnedId) return;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/pinned/${pinnedId}`, { method: "DELETE" });
+        if (res.ok) {
+          await loadTrackedData();
+          showToast("Producto desfijado. En la próxima actualización usará búsqueda automática.");
+        }
+      } finally {
+        btn.disabled = false;
+      }
     });
   });
 
@@ -856,11 +1000,16 @@ function renderBasketComparison() {
     .join("");
 
   const cart = getActiveCart();
+  const barsBox = document.getElementById("cartComparisonBarsBox");
+  const roadmapProgBox = document.getElementById("roadmapProgressBarBox");
+
   if (!cart) {
     if (strategiesGrid) strategiesGrid.innerHTML = `<div class="empty-state">Crea un carrito para empezar a comparar precios.</div>`;
+    if (barsBox) barsBox.innerHTML = "";
     if (summaryGrid) summaryGrid.innerHTML = "";
     if (tbody) tbody.innerHTML = "";
     if (roadmapGrid) roadmapGrid.innerHTML = "";
+    if (roadmapProgBox) roadmapProgBox.innerHTML = "";
     return;
   }
 
@@ -902,10 +1051,12 @@ function renderBasketComparison() {
   if (cart.items.length === 0) {
     if (strategiesGrid)
       strategiesGrid.innerHTML = `<div class="empty-state">Tu carrito está vacío. Agrega productos arriba para ver dónde es más barato.</div>`;
+    if (barsBox) barsBox.innerHTML = "";
     if (summaryGrid) summaryGrid.innerHTML = "";
     if (tbody)
       tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;padding:2rem;" class="small-muted">Sin productos en este carrito aún.</td></tr>`;
     if (roadmapGrid) roadmapGrid.innerHTML = "";
+    if (roadmapProgBox) roadmapProgBox.innerHTML = "";
     return;
   }
 
@@ -915,7 +1066,8 @@ function renderBasketComparison() {
   const split = cart.optimalSplitCart;
 
   if (strategiesGrid) {
-    const netSingle = winSingle?.netTotalClp ?? winSingle?.totalClp;
+    const netSingle = winSingle?.netDiscountedTotalClp ?? winSingle?.netTotalClp ?? winSingle?.totalClp;
+    const netTwo = twoCombo?.netDiscountedTotalClp ?? twoCombo?.netTotalClp ?? twoCombo?.totalClp;
     const netSplit = split.netTotalClp ?? split.totalClp;
 
     strategiesGrid.innerHTML = `
@@ -930,8 +1082,12 @@ function renderBasketComparison() {
             winSingle
               ? `Cubre ${winSingle.foundCount} de ${winSingle.totalItemsCount} productos. ${
                   winSingle.deliveryFee > 0
-                    ? `(${fmtClp(winSingle.totalClp)} prod. + ${fmtClp(winSingle.deliveryFee)} despacho).`
-                    : `(${fmtClp(winSingle.totalClp)} prod. · Despacho Gratis).`
+                    ? `(${fmtClp(winSingle.discountedTotalClp ?? winSingle.totalClp)} post-dcto + ${fmtClp(winSingle.deliveryFee)} despacho).`
+                    : `(${fmtClp(winSingle.discountedTotalClp ?? winSingle.totalClp)} post-dcto · Despacho Gratis).`
+                } ${
+                  winSingle.cardSavingsClp > 0
+                    ? `<br/><span style="color:#60a5fa; font-weight:700;">💳 Incluye ${fmtClp(winSingle.cardSavingsClp)} de ahorro con tarjetas/día.</span>`
+                    : ""
                 } ${
                   cart.singleStoreMaxSavingsClp > 0
                     ? `<br/><strong style="color:#34d399;">Ahorras ${fmtClp(cart.singleStoreMaxSavingsClp)}</strong> vs el supermercado más caro.`
@@ -944,14 +1100,20 @@ function renderBasketComparison() {
 
       <div class="strategy-card">
         <div class="strategy-tag" style="color:#fbbf24;">🥈 OPCIÓN 2: COMBINAR MÁXIMO 2 SUPERMERCADOS</div>
-        <div class="strategy-price">${twoCombo ? fmtClp(twoCombo.netTotalClp || twoCombo.totalClp) : "—"}</div>
+        <div class="strategy-price">${twoCombo ? fmtClp(netTwo) : "—"}</div>
         <div class="small-muted" style="margin-top:0.25rem;">
           ${
             twoCombo
-              ? `Comprando en <strong>${twoCombo.storeNames}</strong> (${twoCombo.foundCount} productos${twoCombo.deliveryFeesClp > 0 ? ` · incluye ${fmtClp(twoCombo.deliveryFeesClp)} despacho` : " · Despacho Gratis"}). ${
-                  winSingle && (winSingle.netTotalClp ?? winSingle.totalClp) > (twoCombo.netTotalClp || twoCombo.totalClp)
-                    ? `Ahorras <strong>${fmtClp((winSingle.netTotalClp ?? winSingle.totalClp) - (twoCombo.netTotalClp || twoCombo.totalClp))} netos</strong> vs ir a 1 sola tienda.`
-                    : "Mismo o mayor costo neto que ir a 1 tienda."
+              ? `Comprando en <strong>${twoCombo.storeNames}</strong> (${twoCombo.foundCount} productos${twoCombo.deliveryFeesClp > 0 ? ` · incluye ${fmtClp(twoCombo.deliveryFeesClp)} despacho` : " · Despacho Gratis"}).
+                ${
+                  twoCombo.rebalancedForFreeDelivery
+                    ? `<br/><span style="color:#34d399; font-weight:700;">✨ Rebalanceo inteligente: movió ${twoCombo.movedItemsCount} ítem(s) para alcanzar envío gratis y ahorrar ${fmtClp(twoCombo.deliverySavedClp)}.</span>`
+                    : ""
+                }
+                ${
+                  winSingle && netSingle > netTwo
+                    ? `<br/>Ahorras <strong>${fmtClp(netSingle - netTwo)} netos</strong> vs ir a 1 sola tienda.`
+                    : `<br/>Mismo o mayor costo neto que ir a 1 tienda.`
                 }`
               : "Requiere al menos 2 tiendas con stock."
           }
@@ -962,14 +1124,14 @@ function renderBasketComparison() {
         <div class="strategy-tag" style="color:#34d399;">🏆 OPCIÓN 3: COMPRA DIVIDIDA ÓPTIMA (${split.storesUsedCount} TIENDAS)</div>
         <div class="strategy-price" style="color:#34d399;">${fmtClp(netSplit)}</div>
         <div class="small-muted" style="margin-top:0.25rem;">
-          Comprar cada producto en su supermercado más barato.
+          Comprar cada producto en su supermercado más barato (con dctos. aplicados).
           <br/>
-          <span>(${fmtClp(split.totalClp)} en productos ${
-            split.deliveryFeesClp > 0 ? `+ ${fmtClp(split.deliveryFeesClp)} en ${split.storesUsedCount} despachos` : ""
+          <span>(${fmtClp(split.discountedTotalClp ?? split.totalClp)} en productos ${
+            split.deliveryFeesClp > 0 ? `+ ${fmtClp(split.deliveryFeesClp)} en ${split.storesUsedCount} despachos` : "· Envío Gratis"
           })</span>
           ${
             split.savingsVsBestSingleClp > 0
-              ? `<br/><strong style="color:#34d399;">Ahorras ${fmtClp(split.savingsVsBestSingleClp)} netos</strong> frente a comprar todo en ${winSingle?.storeName}.`
+              ? `<br/><strong style="color:#34d399;">Ahorras ${fmtClp(split.savingsVsBestSingleClp)} en productos</strong> frente a ${winSingle?.storeName}.`
               : `<br/><span>No compensa dividir pedidos frente al mejor supermercado único.</span>`
           }
         </div>
@@ -977,12 +1139,39 @@ function renderBasketComparison() {
     `;
   }
 
-  // 2. Renderizar el Ranking de todos los supermercados (Todo en 1 lugar con Despacho y Tarjetas)
+  // 2a. Gráfico de Barras Comparativo Horizontal (Neto post-descuentos + Envío)
+  if (barsBox) {
+    const ranking = cart.singleStoreRanking || [];
+    const maxNet = Math.max(1, ...ranking.map((r) => r.netDiscountedTotalClp || r.netTotalClp || r.totalClp || 1));
+    barsBox.innerHTML = ranking
+      .map((st, idx) => {
+        const netVal = st.netDiscountedTotalClp ?? st.netTotalClp ?? st.totalClp;
+        const pct = Math.max(12, Math.min(100, Math.round((netVal / maxNet) * 100)));
+        const rankCls = idx === 0 ? "rank-1" : idx === ranking.length - 1 ? "rank-last" : "rank-mid";
+        return `
+          <div class="cart-bar-row">
+            <span class="cart-bar-store-label">${idx === 0 ? "🥇 " : ""}${st.storeName}</span>
+            <div class="cart-bar-track" title="${st.storeName}: ${fmtClp(netVal)} (${st.foundCount}/${st.totalItemsCount} prod.)">
+              <div class="cart-bar-fill ${rankCls}" style="width: ${pct}%;"></div>
+            </div>
+            <span class="cart-bar-amount" style="color:${idx === 0 ? "#34d399" : "#f8fafc"};">
+              ${fmtClp(netVal)} <span class="small-muted" style="font-weight:400;">(${st.foundCount}/${st.totalItemsCount})</span>
+            </span>
+          </div>
+        `;
+      })
+      .join("");
+  }
+
+  // 2. Renderizar el Ranking de todos los supermercados (Todo en 1 lugar con Despacho, Barra Envío Gratis y Tarjetas)
   if (summaryGrid) {
     summaryGrid.innerHTML = cart.singleStoreRanking
       .map((st, idx) => {
         const isWinner = idx === 0;
-        const netTotal = st.netTotalClp || st.totalClp;
+        const netTotal = st.netDiscountedTotalClp ?? st.netTotalClp ?? st.totalClp;
+        const postDiscSub = st.discountedTotalClp ?? st.totalClp;
+        const delivProg = st.deliveryProgressPct ?? 100;
+        const delivGap = st.deliveryGapClp ?? 0;
 
         return `
           <div class="basket-store-card ${isWinner ? "optimal" : ""}">
@@ -998,7 +1187,9 @@ function renderBasketComparison() {
               ${fmtClp(netTotal)}
             </div>
             <div class="kpi-sub" style="margin-top:0.25rem;">
-              <span>📦 Productos: <strong>${fmtClp(st.totalClp)}</strong></span>
+              <span>📦 Productos: <strong>${fmtClp(postDiscSub)}</strong>${
+                st.cardSavingsClp > 0 ? ` <span class="crossed-price">${fmtClp(st.totalClp)}</span>` : ""
+              }</span>
               ${
                 st.deliveryFee > 0
                   ? ` · 🚚 Despacho: <strong>${fmtClp(st.deliveryFee)}</strong>`
@@ -1016,6 +1207,17 @@ function renderBasketComparison() {
                   ? `<br/><span style="color:#34d399;">🏷️ Incluye ${fmtClp(st.offerSavingsClp)} de ahorro en promociones</span>`
                   : ""
               }
+            </div>
+            <div class="delivery-progress-box">
+              <div class="delivery-progress-head">
+                <span>${delivGap === 0 ? "🚚 Umbral Envío Gratis" : "Para Envío Gratis:"}</span>
+                <strong style="color:${delivGap === 0 ? "#34d399" : "#fbbf24"};">
+                  ${delivGap === 0 ? "¡Completado! (100%)" : `Falta ${fmtClp(delivGap)} (${delivProg}%)`}
+                </strong>
+              </div>
+              <div class="delivery-progress-track">
+                <div class="delivery-progress-fill ${delivGap === 0 ? "is-free" : ""}" style="width: ${delivProg}%;"></div>
+              </div>
             </div>
           </div>
         `;
@@ -1049,8 +1251,12 @@ function renderBasketComparison() {
           </div>
           <div class="cart-nutrition-grid">
             ${storesWithNutrition
-              .map(
-                (st) => `
+              .map((st) => {
+                const maxProt = Math.max(1, ...storesWithNutrition.map((x) => x.totalProteinGrams || 1));
+                const protBarPct = Math.max(8, Math.round(((st.totalProteinGrams || 0) / maxProt) * 100));
+                const scoreVal = st.avgNutritionScore || 0;
+                const sGradeCls = scoreVal >= 85 ? "grade-a" : scoreVal >= 70 ? "grade-b" : scoreVal >= 50 ? "grade-c" : "grade-d";
+                return `
               <div class="cart-nutrition-store-card ${bestProtStore && bestProtStore.store === st.store ? "is-best-prot" : ""}">
                 <div style="display:flex; justify-content:space-between; align-items:center;">
                   <span class="store-badge store-${st.store}">${st.storeName}</span>
@@ -1062,9 +1268,25 @@ function renderBasketComparison() {
                 <div class="small-muted">
                   ${st.avgCostPer10gProtein ? `Costo proteico: <strong>${fmtClp(st.avgCostPer10gProtein)} / 10g</strong>` : "Sin densidad proteica calculada"}
                 </div>
+                <div class="nutrition-score-bar-wrap" title="Proteína relativa del carrito (${st.totalProteinGrams}g)">
+                  <span class="small-muted" style="min-width:34px;">Prot</span>
+                  <div class="nutrition-score-track">
+                    <div class="nutrition-score-fill grade-b" style="width:${protBarPct}%;"></div>
+                  </div>
+                </div>
+                ${
+                  scoreVal > 0
+                    ? `<div class="nutrition-score-bar-wrap" title="Score Nutricional promedio (${scoreVal}/100)">
+                        <span class="small-muted" style="min-width:34px;">Calidad</span>
+                        <div class="nutrition-score-track">
+                          <div class="nutrition-score-fill ${sGradeCls}" style="width:${scoreVal}%;"></div>
+                        </div>
+                      </div>`
+                    : ""
+                }
               </div>
-            `
-              )
+            `;
+              })
               .join("")}
           </div>
           ${
@@ -1096,13 +1318,20 @@ function renderBasketComparison() {
 
         const storeCellsHtml = CART_TABLE_STORES.map((storeId) => {
           const offer = item.storeOffers[storeId];
+          const liderBtnHtml =
+            storeId === "lider"
+              ? `<button type="button" class="btn-lider-inline btn-update-cart-lider" data-item-id="${item.id}" data-label="${item.label.replace(/"/g, "&quot;")}" title="Pegar o actualizar precio de Lider.cl aquí mismo">🟦 ${offer ? "Actualizar" : "Cargar"} Lider</button>`
+              : "";
+
           if (!offer) {
-            return `<td class="small-muted">—</td>`;
+            return `<td class="small-muted"><div>—</div>${liderBtnHtml}</td>`;
           }
 
           const isBest = bestStore === storeId;
           const p = offer.product;
           const candidates = offer.candidates || [];
+          const effLine = offer.discountedLineTotal ?? offer.lineTotal;
+          const hasCardDisc = offer.cardDiscount && offer.cardDiscount.discountPct > 0 && effLine < offer.lineTotal;
 
           const selectorHtml =
             candidates.length > 1
@@ -1126,7 +1355,7 @@ function renderBasketComparison() {
           return `
             <td style="${isBest ? "background:rgba(16,185,129,0.11); border-left:2px solid #10b981;" : ""}">
               <div style="font-size:0.98rem; font-weight:800; color:${isBest ? "#34d399" : "#f8fafc"};">
-                ${fmtClp(offer.lineTotal)}
+                ${hasCardDisc ? `<span class="crossed-price" style="font-size:0.8rem;">${fmtClp(offer.lineTotal)}</span> ` : ""}${fmtClp(effLine)}
                 ${
                   (offer.qty || item.quantity) > 1 || offer.isScaledQty
                     ? `<span class="small-muted" style="font-weight:400;">(${offer.qty || item.quantity} × ${fmtClp(offer.effectivePackagePrice)}${offer.isScaledQty ? " · eq." : ""})</span>`
@@ -1139,6 +1368,16 @@ function renderBasketComparison() {
               <div style="font-size:0.75rem; color:#e2e8f0;">
                 Envase: <strong>${fmtClp(p.price)}</strong>/un${p.bundlePricePerItem && p.bundlePricePerItem < p.price ? ` · <span style="color:#fbbf24; font-weight:700;">🏷️ ${fmtClp(p.bundlePricePerItem)}/un</span>` : ""}
               </div>
+              ${
+                hasCardDisc
+                  ? `<div style="font-size:0.7rem; color:#60a5fa; font-weight:700;">💳 ${offer.cardDiscount.label} (-${offer.cardDiscount.discountPct}%)</div>`
+                  : ""
+              }
+              ${
+                offer.sizeDiffNote
+                  ? `<div class="size-diff-note" title="Diferencia de contenido neto frente al ítem de referencia">⚖️ ${offer.sizeDiffNote}</div>`
+                  : ""
+              }
               ${
                 p.brand
                   ? `<div style="font-size:0.72rem; color:#93c5fd; font-weight:600;">🏷️ ${p.brand}</div>`
@@ -1160,6 +1399,7 @@ function renderBasketComparison() {
                   ? `<div class="nutrition-badge-mini" style="color:#a7f3d0;">${p.nutritionBadge}</div>`
                   : ""
               }
+              ${renderNutritionSealsHtml(p.nutritionSeals)}
               ${
                 p.purityWarning
                   ? `<div class="purity-warning-pill ${p.isPure === false ? "is-impure" : "is-blend"}" style="margin-top:0.2rem;">${p.purityWarning}</div>`
@@ -1171,6 +1411,7 @@ function renderBasketComparison() {
                   : ""
               }
               ${selectorHtml}
+              ${liderBtnHtml}
             </td>
           `;
         }).join("");
@@ -1275,40 +1516,105 @@ function renderBasketComparison() {
         showToast(`Marca actualizada en ${STORE_META[store].name}.`);
       });
     });
+
+    tbody.querySelectorAll(".btn-update-cart-lider").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        openCartLiderUpdateModal(cart.id, btn.dataset.itemId, btn.dataset.label);
+      });
+    });
   }
 
-  // 4. Renderizar Hoja de Ruta de Compra Dividida por Supermercado
+  // 4. Renderizar Hoja de Ruta y Checklist de Súper (Modo Pasillo con localStorage)
   if (roadmapGrid) {
+    const checkedSet = getCartChecklistSet(cart.id);
+    const allRoadmapItems = (split.byStore || []).flatMap((group) =>
+      group.items.map((it) => ({ key: `${group.store}:${it.itemId}`, lineTotal: it.lineTotal || 0 }))
+    );
+
+    const renderRoadmapStatsBar = () => {
+      if (!roadmapProgBox) return;
+      const totalCnt = allRoadmapItems.length;
+      const doneCnt = allRoadmapItems.filter((x) => checkedSet.has(x.key)).length;
+      const checkedClp = allRoadmapItems
+        .filter((x) => checkedSet.has(x.key))
+        .reduce((s, x) => s + x.lineTotal, 0);
+      const totalClpSum = allRoadmapItems.reduce((s, x) => s + x.lineTotal, 0);
+      const remClp = Math.max(0, totalClpSum - checkedClp);
+      const pct = totalCnt > 0 ? Math.round((doneCnt / totalCnt) * 100) : 0;
+      roadmapProgBox.innerHTML = `
+        <div class="roadmap-progress-stats">
+          <span>✅ En carro: <strong>${doneCnt} / ${totalCnt}</strong> ítems (${pct}%)</span>
+          <span>🛒 Comprado: <strong style="color:#34d399;">${fmtClp(checkedClp)}</strong> · Pendiente: <strong style="color:#fbbf24;">${fmtClp(remClp)}</strong></span>
+        </div>
+        <div class="roadmap-progress-track">
+          <div class="roadmap-progress-fill" style="width:${pct}%;"></div>
+        </div>
+      `;
+    };
+
+    renderRoadmapStatsBar();
+
     roadmapGrid.innerHTML = (split.byStore || [])
       .map(
         (group) => `
         <div class="roadmap-store-card">
           <div class="roadmap-store-head">
             <span class="store-badge store-${group.store}">${group.storeName} (${group.items.length} prod.)</span>
-            <strong style="font-size:1.05rem; color:#34d399;">Subtotal: ${fmtClp(group.subtotalClp)}</strong>
+            <strong style="font-size:1.05rem; color:#34d399;">Subtotal: ${fmtClp(group.discountedSubtotalClp ?? group.subtotalClp)}</strong>
           </div>
           <ul class="roadmap-item-list">
             ${group.items
-              .map(
-                (it) => `
+              .map((it) => {
+                const cKey = `${group.store}:${it.itemId}`;
+                const isDone = checkedSet.has(cKey);
+                return `
                 <li>
-                  <div>
-                    <strong>${it.quantity}×</strong>
-                    <a href="${it.url || "#"}" target="_blank" rel="noopener" style="color:#f1f5f9;">
-                      ${it.productName}
-                    </a>
-                    <span class="small-muted">(${fmtUnitScaled(it.unitPrice, it.unit, state.unitScale, it.pricePer10gProtein)})</span>
-                  </div>
-                  <strong style="white-space:nowrap;">${fmtClp(it.lineTotal)}</strong>
+                  <label class="checklist-row ${isDone ? "is-checked" : ""}" style="width:100%;">
+                    <input type="checkbox" class="checklist-item-cb" data-ckey="${cKey}" ${isDone ? "checked" : ""} />
+                    <div class="checklist-text" style="flex:1;">
+                      <strong>${it.qty || it.quantity}×</strong>
+                      <a href="${it.url || "#"}" target="_blank" rel="noopener" style="color:#f1f5f9;">
+                        ${it.productName}
+                      </a>
+                      <span class="small-muted">(${fmtUnitScaled(it.unitPrice, it.unit, state.unitScale, it.pricePer10gProtein)})</span>
+                      ${it.cardBadge ? `<span class="brand-mini-pill">💳 ${it.cardBadge}</span>` : ""}
+                    </div>
+                    <strong class="checklist-text" style="white-space:nowrap;">${fmtClp(it.lineTotal)}</strong>
+                  </label>
                 </li>
-              `
-              )
+              `;
+              })
               .join("")}
           </ul>
         </div>
       `
       )
       .join("");
+
+    roadmapGrid.querySelectorAll(".checklist-item-cb").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const key = cb.dataset.ckey;
+        const rowLabel = cb.closest(".checklist-row");
+        if (cb.checked) {
+          checkedSet.add(key);
+          rowLabel?.classList.add("is-checked");
+        } else {
+          checkedSet.delete(key);
+          rowLabel?.classList.remove("is-checked");
+        }
+        saveCartChecklistSet(cart.id, checkedSet);
+        renderRoadmapStatsBar();
+      });
+    });
+
+    const resetBtn = document.getElementById("btnResetChecklist");
+    if (resetBtn) {
+      resetBtn.onclick = () => {
+        checkedSet.clear();
+        saveCartChecklistSet(cart.id, checkedSet);
+        renderBasketComparison();
+      };
+    }
   }
 }
 
@@ -1387,6 +1693,20 @@ function renderSearchProductCard(p, idx, bestUnitPrice) {
     ? `<div class="nutrition-badge ${gradeClass}" style="margin-top:0.35rem;">${p.nutritionBadge}</div>`
     : "";
 
+  const nutritionScoreBarHtml =
+    p.nutritionScore > 0
+      ? `<div class="nutrition-score-bar-wrap" title="Score Nutricional: ${p.nutritionScore}/100">
+          <span class="small-muted" style="min-width:54px;">Score ${p.nutritionScore}</span>
+          <div class="nutrition-score-track">
+            <div class="nutrition-score-fill ${
+              p.nutritionScore >= 85 ? "grade-a" : p.nutritionScore >= 70 ? "grade-b" : p.nutritionScore >= 50 ? "grade-c" : "grade-d"
+            }" style="width:${Math.min(100, Math.max(8, p.nutritionScore))}%;"></div>
+          </div>
+        </div>`
+      : "";
+
+  const sealsHtml = renderNutritionSealsHtml(p.nutritionSeals);
+
   const purityHtml = p.purityWarning
     ? `<div class="purity-warning-pill ${p.isPure === false ? "is-impure" : "is-blend"}" style="margin-top:0.3rem;">${p.purityWarning}</div>`
     : "";
@@ -1429,6 +1749,8 @@ function renderSearchProductCard(p, idx, bestUnitPrice) {
         </div>
         ${purityHtml}
         ${nutritionBadgeHtml}
+        ${nutritionScoreBarHtml}
+        ${sealsHtml}
       </div>
 
       <div>
@@ -1669,11 +1991,20 @@ function renderLiveSearchResults() {
         return unitA - unitB;
       });
 
+      const maxBrandMinUnit = Math.max(
+        1,
+        ...sortedGroups.map(([, entries]) => Math.min(...entries.map((x) => x.p.unitPrice || 1)))
+      );
+
       container.innerHTML = sortedGroups
         .map(([bName, entries]) => {
           const firstP = entries[0].p;
           const uLbl = firstP.unit === "kg" ? "kg" : firstP.unit === "lt" ? "L" : "un";
           const minUnit = Math.min(...entries.map((x) => x.p.unitPrice));
+          const brandBarPct = Math.max(
+            12,
+            Math.min(100, Math.round((minUnit / maxBrandMinUnit) * 100))
+          );
           const protPrices = entries
             .map((x) => x.p.pricePer10gProtein)
             .filter((v) => v && v > 0);
@@ -1682,15 +2013,20 @@ function renderLiveSearchResults() {
 
           return `
             <section class="brand-group-section">
-              <div class="brand-group-header">
-                <div style="display:flex; align-items:center; gap:0.65rem; flex-wrap:wrap;">
-                  <span class="brand-group-title">🏢 ${bName}</span>
-                  <span class="small-muted">${entries.length} ${entries.length === 1 ? "formato" : "formatos / tiendas"}</span>
+              <div class="brand-group-header" style="flex-direction:column; align-items:stretch;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
+                  <div style="display:flex; align-items:center; gap:0.65rem; flex-wrap:wrap;">
+                    <span class="brand-group-title">🏢 ${bName}</span>
+                    <span class="small-muted">${entries.length} ${entries.length === 1 ? "formato" : "formatos / tiendas"}</span>
+                  </div>
+                  <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
+                    <span class="savings-badge">Mejor $/u: ${fmtClp(minUnit)}/${uLbl}</span>
+                    ${minProt ? `<span class="protein-tag" style="margin:0;">🥩 Desde ${fmtClp(minProt)}/10g prot</span>` : ""}
+                    ${maxScore > 0 ? `<span class="nutrition-badge ${maxScore >= 90 ? "grade-aplus" : maxScore >= 80 ? "grade-a" : "grade-b"}">Score máx ${maxScore}/100</span>` : ""}
+                  </div>
                 </div>
-                <div style="display:flex; align-items:center; gap:0.5rem; flex-wrap:wrap;">
-                  <span class="savings-badge">Mejor $/u: ${fmtClp(minUnit)}/${uLbl}</span>
-                  ${minProt ? `<span class="protein-tag" style="margin:0;">🥩 Desde ${fmtClp(minProt)}/10g prot</span>` : ""}
-                  ${maxScore > 0 ? `<span class="nutrition-badge ${maxScore >= 90 ? "grade-aplus" : maxScore >= 80 ? "grade-a" : "grade-b"}">Score máx ${maxScore}/100</span>` : ""}
+                <div class="brand-bar-strip" title="Comparativa del mejor $/unidad de ${bName} frente al rango de marcas">
+                  <div class="brand-bar-strip-fill" style="width:${brandBarPct}%;"></div>
                 </div>
               </div>
               <div class="search-results-grid">
@@ -1761,10 +2097,75 @@ async function renderIpcSection() {
     const bestEl = document.getElementById("ipcBestStore");
     const bestSub = document.getElementById("ipcBestStoreSub");
 
+    const mainPct = data.weightedBasketInflationPct ?? data.basketInflationPct ?? 0;
     if (rateEl) {
-      const sign = data.basketInflationPct > 0 ? "+" : "";
-      rateEl.textContent = `${sign}${data.basketInflationPct}%`;
-      rateEl.style.color = data.basketInflationPct > 0 ? "#f87171" : "#34d399";
+      const sign = mainPct > 0 ? "+" : "";
+      rateEl.textContent = `${sign}${mainPct}%`;
+      rateEl.style.color = mainPct > 0 ? "#f87171" : "#34d399";
+      const rateSub = rateEl.nextElementSibling;
+      if (rateSub) {
+        rateSub.textContent = `Ponderada por tu carrito (${data.weightedItemsCount || 0} en carro · Simple: ${
+          data.basketInflationPct > 0 ? "+" : ""
+        }${data.basketInflationPct}%)`;
+      }
+    }
+
+    const renderBidirBar = (pct, maxScale) => {
+      const val = Number(pct || 0);
+      const width = Math.min(100, Math.round((Math.abs(val) / maxScale) * 100));
+      return `
+        <div class="ipc-bidir-track" title="${val > 0 ? "+" : ""}${val}%">
+          <div class="ipc-bidir-left">${val < 0 ? `<div class="ipc-bar-neg" style="width:${width}%;"></div>` : ""}</div>
+          <div class="ipc-bidir-axis"></div>
+          <div class="ipc-bidir-right">${val > 0 ? `<div class="ipc-bar-pos" style="width:${width}%;"></div>` : ""}</div>
+        </div>
+      `;
+    };
+
+    const catBarsBox = document.getElementById("ipcCategoryBreakdownBox");
+    if (catBarsBox) {
+      const cats = data.categoryBreakdown || [];
+      if (cats.length === 0) {
+        catBarsBox.innerHTML = `<div class="small-muted">Requiere al menos 2 mediciones históricas para comparar variaciones por categoría.</div>`;
+      } else {
+        const maxCatAbs = Math.max(10, ...cats.map((c) => Math.abs(c.changePct || 0)));
+        catBarsBox.innerHTML = `<div class="ipc-bars-list">${cats
+          .map((c) => {
+            const sign = c.changePct > 0 ? "+" : "";
+            const clr = c.changePct > 0 ? "#f87171" : c.changePct < 0 ? "#34d399" : "#94a3b8";
+            return `
+              <div class="ipc-bar-row">
+                <span><strong>${c.category}</strong> <span class="small-muted">(${c.itemCount})</span></span>
+                ${renderBidirBar(c.changePct, maxCatAbs)}
+                <span style="text-align:right; font-weight:700; color:${clr};">${sign}${c.changePct}%</span>
+              </div>
+            `;
+          })
+          .join("")}</div>`;
+      }
+    }
+
+    const storeBarsBox = document.getElementById("ipcStoreBarsBox");
+    if (storeBarsBox) {
+      const sEntries = STORE_ORDER.map((sId) => data.storeInflation?.[sId]).filter(Boolean);
+      if (sEntries.length === 0) {
+        storeBarsBox.innerHTML = `<div class="small-muted">Aún no hay suficientes mediciones multi-fecha por supermercado.</div>`;
+      } else {
+        const maxStoreAbs = Math.max(10, ...sEntries.map((s) => Math.abs(s.inflationPct || 0)));
+        storeBarsBox.innerHTML = `<div class="ipc-bars-list">${sEntries
+          .map((s) => {
+            const sign = s.inflationPct > 0 ? "+" : "";
+            const clr = s.inflationPct > 0 ? "#f87171" : s.inflationPct < 0 ? "#34d399" : "#94a3b8";
+            return `
+              <div class="ipc-bar-row">
+                <span class="store-badge store-${s.store}">${STORE_META[s.store]?.name || s.store}</span>
+                ${renderBidirBar(s.inflationPct, maxStoreAbs)}
+                <span style="text-align:right; font-weight:700; color:${clr};">${sign}${s.inflationPct}%</span>
+              </div>
+            `;
+          })
+          .join("")}</div>`;
+      }
     }
 
     const storeEntries = Object.entries(data.storeInflation || {}).filter(
@@ -1877,11 +2278,21 @@ async function loadTelegramSettings() {
     const tokenInput = document.getElementById("teleTokenInput");
     const chatIdInput = document.getElementById("teleChatIdInput");
     const threshInput = document.getElementById("teleThresholdInput");
+    const cartTargetInput = document.getElementById("teleCartTargetInput");
     const enabledInput = document.getElementById("teleEnabledInput");
+    const tokenStatusBadge = document.getElementById("teleTokenStatusBadge");
 
-    if (tokenInput && data.token) tokenInput.value = data.token;
-    if (chatIdInput && data.chatId) chatIdInput.value = data.chatId;
+    if (tokenInput) {
+      tokenInput.value = data.token || "";
+    }
+    if (tokenStatusBadge) {
+      tokenStatusBadge.style.display = data.hasToken ? "inline-flex" : "none";
+    }
+    if (chatIdInput && data.chatId !== undefined) chatIdInput.value = data.chatId;
     if (threshInput && data.thresholdPct) threshInput.value = data.thresholdPct;
+    if (cartTargetInput && data.cartTargetTotalClp !== undefined) {
+      cartTargetInput.value = data.cartTargetTotalClp || 0;
+    }
     if (enabledInput) enabledInput.checked = Boolean(data.enabled);
   } catch (err) {
     console.warn("No se pudieron cargar los ajustes de Telegram:", err);
@@ -1994,6 +2405,7 @@ function switchTab(tabId) {
 async function configureDynamicBookmarklet() {
   const linkEl = document.getElementById("bookmarkletLink");
   const originEl = document.getElementById("bookmarkletOriginCode");
+  const verEl = document.getElementById("bookmarkletTokenVer");
   const origin = window.location.origin;
   if (originEl) originEl.textContent = origin;
   if (!linkEl) return;
@@ -2003,6 +2415,9 @@ async function configureDynamicBookmarklet() {
     const res = await fetch("/api/bookmarklet-info");
     if (res.ok) {
       const info = await res.json();
+      if (verEl && info.tokenVersion) {
+        verEl.textContent = `v${info.tokenVersion}`;
+      }
       if (info.importToken) {
         endpoint += `?token=${encodeURIComponent(info.importToken)}`;
       }
@@ -2011,8 +2426,108 @@ async function configureDynamicBookmarklet() {
     // Fallback sin token
   }
 
-  const code = `(function(){try{var raw='';var el=document.getElementById('__NEXT_DATA__');if(el){raw=el.textContent;}else{raw=document.documentElement.outerHTML;}var xhr=new XMLHttpRequest();xhr.open('POST',${JSON.stringify(endpoint)},true);xhr.setRequestHeader('Content-Type','application/json');xhr.onload=function(){var info='';try{var d=JSON.parse(xhr.responseText||'{}');if(xhr.status>=400){alert('Error ('+xhr.status+'): '+(d.error||'No autorizado'));return;}info=d.count?' ('+d.count+' prod.'+(d.matchedTrackedCount?', '+d.matchedTrackedCount+' seguidos act.':'')+')':'';}catch(e){}var toast=document.createElement('div');toast.style.cssText='position:fixed;top:20px;right:20px;z-index:999999;background:#10b981;color:#fff;padding:14px 20px;border-radius:10px;font-family:sans-serif;font-weight:bold;box-shadow:0 10px 25px rgba(0,0,0,0.4);';toast.innerHTML='🛒 ¡Precios importados a SuperPrecio CL'+info+'!<br><a href="'+(${JSON.stringify(origin)})+'" target="_blank" style="color:#fff;text-decoration:underline;font-size:12px;">Abrir Comparador</a>';document.body.appendChild(toast);setTimeout(function(){toast.remove();},6000);};xhr.onerror=function(){alert('Error conectando a SuperPrecio CL en '+${JSON.stringify(origin)});};xhr.send(JSON.stringify({rawContent:raw,url:location.href}));}catch(e){alert('Error: '+e.message);}})();`;
-  linkEl.href = `javascript:${code}`;
+  const bookmarkletFn = function (ep, orig) {
+    try {
+      var isCart = location.pathname.indexOf("/cart") !== -1;
+      var raw = "";
+      var cartItems = [];
+      var nextEl = document.getElementById("__NEXT_DATA__");
+      if (nextEl) {
+        raw = nextEl.textContent || "";
+      }
+      if (isCart) {
+        var seenHref = {};
+        var anchors = Array.prototype.slice.call(document.querySelectorAll('a[href*="/ip/"]'));
+        anchors.forEach(function (a) {
+          var href = (a.href || "").split("?")[0];
+          var txt = (a.textContent || "").trim();
+          if (!href || seenHref[href] || txt.length < 4) return;
+          var box = a.closest('li, article, [data-testid*="cart-item"], [data-testid*="item"]') || a.parentElement;
+          for (var step = 0; step < 5 && box && (box.textContent || "").indexOf("$") === -1; step++) {
+            box = box.parentElement;
+          }
+          if (!box) return;
+          var boxText = box.innerText || box.textContent || "";
+          if (boxText.length > 1800) return;
+          var priceMatches = boxText.match(/\$[\s]*[\d.]{3,9}/g) || [];
+          if (!priceMatches.length) return;
+          seenHref[href] = true;
+          var qty = 1;
+          var qInput = box.querySelector('input[type="number"], input[aria-label*="antidad" i], input[aria-label*="qty" i]');
+          if (qInput && Number(qInput.value) > 0) {
+            qty = Number(qInput.value);
+          } else {
+            var qSpans = box.querySelectorAll('span, button, div');
+            for (var qi = 0; qi < qSpans.length; qi++) {
+              var qt = (qSpans[qi].textContent || "").trim();
+              if (/^\d{1,2}$/.test(qt) && Number(qt) >= 1 && Number(qt) <= 50) {
+                qty = Number(qt);
+                break;
+              }
+            }
+          }
+          var img = box.querySelector("img");
+          cartItems.push({
+            name: txt.replace(/\s+/g, " "),
+            url: a.href,
+            qty: qty,
+            linePrice: priceMatches[0],
+            listPrice: priceMatches[1] || "",
+            imageUrl: img ? img.src : "",
+          });
+        });
+      }
+      if (!raw) {
+        raw = cartItems.length > 0 ? document.body.innerText.slice(0, 120000) : document.documentElement.outerHTML;
+      }
+      var xhr = new XMLHttpRequest();
+      xhr.open("POST", ep, true);
+      xhr.setRequestHeader("Content-Type", "application/json");
+      xhr.onload = function () {
+        var info = "";
+        try {
+          var d = JSON.parse(xhr.responseText || "{}");
+          if (xhr.status >= 400) {
+            alert("Error (" + xhr.status + "): " + (d.error || "No autorizado"));
+            return;
+          }
+          if (d.isCartImport) {
+            info = " — Carrito cotizado (" + (d.importedItemsCount || d.count || 0) + " prod. en 5 súper)";
+          } else if (d.count) {
+            info = " (" + d.count + " prod." + (d.matchedTrackedCount ? ", " + d.matchedTrackedCount + " seguidos act." : "") + ")";
+          }
+        } catch (e) {}
+        var toast = document.createElement("div");
+        toast.style.cssText =
+          "position:fixed;top:20px;right:20px;z-index:999999;background:#10b981;color:#fff;padding:14px 20px;border-radius:10px;font-family:sans-serif;font-weight:bold;box-shadow:0 10px 25px rgba(0,0,0,0.4);max-width:360px;";
+        toast.innerHTML =
+          "🛒 ¡Importado a SuperPrecio CL" +
+          info +
+          '!<br><a href="' +
+          orig +
+          '" target="_blank" style="color:#fff;text-decoration:underline;font-size:12px;">Abrir Comparador</a>';
+        document.body.appendChild(toast);
+        setTimeout(function () {
+          toast.remove();
+        }, 7000);
+      };
+      xhr.onerror = function () {
+        alert("Error conectando a SuperPrecio CL en " + orig);
+      };
+      xhr.send(
+        JSON.stringify({
+          mode: isCart ? "cart" : "auto",
+          rawContent: raw,
+          cartItems: cartItems,
+          url: location.href,
+        })
+      );
+    } catch (e) {
+      alert("Error: " + e.message);
+    }
+  };
+
+  linkEl.href = `javascript:(${bookmarkletFn.toString()})(${JSON.stringify(endpoint)},${JSON.stringify(origin)});`;
 }
 
 async function bootApp() {
@@ -2471,15 +2986,17 @@ window.addEventListener("DOMContentLoaded", () => {
     const token = document.getElementById("teleTokenInput").value.trim();
     const chatId = document.getElementById("teleChatIdInput").value.trim();
     const thresholdPct = Number(document.getElementById("teleThresholdInput").value) || 12;
+    const cartTargetTotalClp = Number(document.getElementById("teleCartTargetInput")?.value) || 0;
     const enabled = document.getElementById("teleEnabledInput").checked;
 
     try {
       const res = await fetch("/api/telegram", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ token, chatId, thresholdPct, enabled }),
+        body: JSON.stringify({ token, chatId, thresholdPct, cartTargetTotalClp, enabled }),
       });
       if (res.ok) {
+        await loadTelegramSettings();
         showToast("Ajustes de Telegram guardados con éxito.");
       } else {
         showToast("Error guardando ajustes de Telegram.");
@@ -2492,7 +3009,8 @@ window.addEventListener("DOMContentLoaded", () => {
   document.getElementById("btnTestTelegram")?.addEventListener("click", async () => {
     const token = document.getElementById("teleTokenInput").value.trim();
     const chatId = document.getElementById("teleChatIdInput").value.trim();
-    if (!token || !chatId) {
+    const hasSavedToken = Boolean(state.telegramSettings?.hasToken);
+    if ((!token && !hasSavedToken) || !chatId) {
       showToast("Ingresa primero tu Bot Token y Chat ID.");
       return;
     }
@@ -2550,6 +3068,7 @@ window.addEventListener("DOMContentLoaded", () => {
     btn.disabled = true;
     btn.textContent = "⏳ Consultando supermercados...";
     try {
+      const targetPriceRaw = document.getElementById("newTrackTargetPrice")?.value;
       const res = await fetch("/api/tracked", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -2558,6 +3077,7 @@ window.addEventListener("DOMContentLoaded", () => {
           searchQuery: document.getElementById("newTrackQuery").value,
           preferredUnit: document.getElementById("newTrackUnit").value,
           category: document.getElementById("newTrackCategory").value,
+          targetPriceClp: targetPriceRaw ? Number(targetPriceRaw) : null,
         }),
       });
       const data = await res.json();
@@ -2704,24 +3224,134 @@ window.addEventListener("DOMContentLoaded", () => {
     }
   });
 
-  // Importación avanzada de JSON __NEXT_DATA__ de Lider
-  document.getElementById("btnImportLiderRaw")?.addEventListener("click", async () => {
-    const rawContent = document.getElementById("liderRawTextarea").value.trim();
-    const trackedItemId = Number(document.getElementById("manualTrackedSelect").value);
-    if (!rawContent) return;
-
-    const res = await fetch("/api/import-lider", {
-      method: "POST",
+  // Modal Editar Producto Seguido
+  const modalEdit = document.getElementById("modalEditTracked");
+  document.getElementById("btnCloseEditTrackModal")?.addEventListener("click", () => {
+    if (modalEdit) modalEdit.style.display = "none";
+  });
+  document.getElementById("btnCancelEditTrack")?.addEventListener("click", () => {
+    if (modalEdit) modalEdit.style.display = "none";
+  });
+  document.getElementById("formEditTracked")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = Number(document.getElementById("editTrackId").value);
+    const targetRaw = document.getElementById("editTrackTargetPrice").value.trim();
+    const res = await fetch(`/api/tracked/${id}`, {
+      method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rawContent, trackedItemId }),
+      body: JSON.stringify({
+        title: document.getElementById("editTrackTitle").value.trim(),
+        searchQuery: document.getElementById("editTrackQuery").value.trim(),
+        preferredUnit: document.getElementById("editTrackUnit").value,
+        category: document.getElementById("editTrackCategory").value,
+        targetPriceClp: targetRaw ? Number(targetRaw) : null,
+      }),
     });
-    const data = await res.json();
-    if (!res.ok) {
-      showToast(data.error || "Error al procesar JSON de Lider");
+    if (res.ok) {
+      if (modalEdit) modalEdit.style.display = "none";
+      await loadTrackedData();
+      showToast("Seguimiento actualizado con éxito.");
+    } else {
+      showToast("No se pudo actualizar el seguimiento.");
+    }
+  });
+
+  // Modal Actualizar Lider directo en Fila del Carrito
+  const modalCartLider = document.getElementById("modalCartLiderUpdate");
+  document.getElementById("btnCloseCartLiderModal")?.addEventListener("click", () => {
+    if (modalCartLider) modalCartLider.style.display = "none";
+  });
+  document.getElementById("btnCancelCartLiderModal")?.addEventListener("click", () => {
+    if (modalCartLider) modalCartLider.style.display = "none";
+  });
+  document.getElementById("formCartLiderUpdate")?.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const cId = Number(document.getElementById("cartLiderCartId").value);
+    const itId = Number(document.getElementById("cartLiderItemId").value);
+    const rawContent = document.getElementById("cartLiderRawInput").value.trim();
+    if (!rawContent) return;
+    const btn = document.getElementById("btnSubmitCartLider");
+    btn.disabled = true;
+    btn.textContent = "⏳ Procesando...";
+    try {
+      const res = await fetch(`/api/carts/${cId}/items/${itId}/lider`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawContent }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Error al importar Lider");
+      if (data.carts) state.carts = data.carts;
+      if (modalCartLider) modalCartLider.style.display = "none";
+      renderAll();
+      showToast(`Oferta Lider cargada: ${data.selectedName || "OK"}`);
+    } catch (err) {
+      showToast(err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🟦 Guardar Oferta Lider";
+    }
+  });
+
+  // Rotar Token de Bookmarklet
+  document.getElementById("btnRotateBookmarkletToken")?.addEventListener("click", async () => {
+    const res = await fetch("/api/bookmarklet-rotate", { method: "POST" });
+    if (res.ok) {
+      const data = await res.json();
+      await configureDynamicBookmarklet();
+      showToast(`Token rotado a v${data.tokenVersion}. Vuelve a arrastrar el botón verde a tu barra de favoritos.`);
+    }
+  });
+
+  // Importación avanzada de Carrito / JSON / Markdown de Lider
+  document.getElementById("btnImportLiderRaw")?.addEventListener("click", async () => {
+    const rawContent = document.getElementById("liderRawTextarea")?.value.trim() || "";
+    const cartName = document.getElementById("liderCartNameInput")?.value.trim() || "";
+    const mode = document.getElementById("liderImportModeSelect")?.value || "auto";
+    const trackedItemId =
+      mode === "tracked" ? Number(document.getElementById("manualTrackedSelect")?.value) || undefined : undefined;
+    const resultBox = document.getElementById("liderImportResultBox");
+    if (!rawContent) {
+      showToast("Pega primero contenido copiado de Lider.cl.");
       return;
     }
-    document.getElementById("liderRawTextarea").value = "";
-    await loadTrackedData();
-    showToast(`Importados ${data.count} productos de Lider y registrado el mejor precio.`);
+
+    const btn = document.getElementById("btnImportLiderRaw");
+    btn.disabled = true;
+    btn.textContent = "⏳ Importando y cotizando en súper...";
+    if (resultBox) resultBox.textContent = "";
+
+    try {
+      const res = await fetch("/api/import-lider", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rawContent, mode, cartName, trackedItemId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        if (resultBox) resultBox.textContent = `❌ ${data.error || "Error"}`;
+        showToast(data.error || "Error al procesar contenido de Lider");
+        return;
+      }
+      document.getElementById("liderRawTextarea").value = "";
+      await loadTrackedData();
+      if (data.isCartImport && data.cartId) {
+        state.activeCartId = data.cartId;
+        renderAll();
+        if (resultBox) {
+          resultBox.textContent = `✅ Carrito creado con ${data.importedItemsCount} productos y cotizado en Jumbo, SISA, Unimarc y Tottus.`;
+        }
+        showToast(`Carrito importado (${data.importedItemsCount} productos). Ve a Tab 2 para comparar.`);
+        switchTab("tab-basket");
+      } else {
+        if (resultBox) {
+          resultBox.textContent = `✅ Importados ${data.count} producto(s) (${data.matchedTrackedCount || 0} seguimientos actualizados).`;
+        }
+        showToast(`Importados ${data.count} productos de Lider.`);
+      }
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🟦 Procesar e Importar Contenido de Lider";
+    }
   });
 });
