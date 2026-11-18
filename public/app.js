@@ -55,7 +55,7 @@ function renderStockBadgeHtml(inStock = true, stockStatus = "in_stock", storeZon
   if (isOut) {
     badge = `<span class="stock-pill stock-out" title="Producto agotado / sin stock disponible en tienda">🚫 Sin Stock</span>`;
   } else if (stockStatus === "unverified_zone") {
-    badge = `<span class="stock-pill stock-unverified" title="La API nacional de esta cadena no valida stock por comuna sin sesión. Verifica o usa el Bookmarklet en tu navegador.">📍 Stock según comuna</span>`;
+    badge = `<span class="stock-pill stock-unverified" title="La API nacional de esta cadena no valida stock por comuna sin sesión. No gana por defecto frente a tiendas con stock confirmado.">📍 Confirma en comuna</span>`;
   } else {
     badge = `<span class="stock-pill stock-ok" title="Stock disponible en tienda">✅ Con Stock</span>`;
   }
@@ -63,6 +63,29 @@ function renderStockBadgeHtml(inStock = true, stockStatus = "in_stock", storeZon
     ? `<span class="zone-mini-pill" title="Tienda / Comuna de stock verificado">🗺️ ${storeZone}</span>`
     : "";
   return badge + zoneTag;
+}
+
+function renderStockToggleButtons({
+  kind,
+  itemId,
+  store,
+  externalId = "",
+  stockStatus = "in_stock",
+}) {
+  const cls = kind === "cart" ? "btn-cart-stock-toggle" : "btn-tracked-stock-toggle";
+  const attrs = `data-item-id="${itemId}" data-store="${store}"${
+    externalId ? ` data-ext-id="${String(externalId).replace(/"/g, "&quot;")}"` : ""
+  }`;
+  if (stockStatus === "out_of_stock") {
+    return `<button type="button" class="btn-stock-mini is-restore ${cls}" ${attrs} data-next="in_stock" title="Volver a marcar como disponible en tu tienda">↺ Stock</button>`;
+  }
+  if (stockStatus === "unverified_zone") {
+    return `
+      <button type="button" class="btn-stock-mini is-confirm ${cls}" ${attrs} data-next="in_stock" title="Confirmar que sí tiene stock en tu comuna">✓</button>
+      <button type="button" class="btn-stock-mini is-out ${cls}" ${attrs} data-next="out_of_stock" title="Marcar como agotado en tu comuna">🚫</button>
+    `;
+  }
+  return `<button type="button" class="btn-stock-mini is-out ${cls}" ${attrs} data-next="out_of_stock" title="Marcar como agotado en tu comuna">🚫</button>`;
 }
 
 function getCartChecklistSet(cartId) {
@@ -161,28 +184,85 @@ function getActiveCart() {
   );
 }
 
-function getLinkCheckInfo(url, fallbackStatus = null) {
+function getLinkCheckInfo(url, fallbackStatus = null, store = "") {
   const checked = url ? state.linkChecksByUrl[url] : null;
-  if (checked) return checked;
+  if (checked) {
+    if (
+      checked.status === "broken" &&
+      (store === "lider" || store === "unimarc" || store === "tottus" || /lider\.cl|unimarc\.cl|tottus\.cl/i.test(url || ""))
+    ) {
+      return { ...checked, status: "protected", ok: true };
+    }
+    return checked;
+  }
   if (fallbackStatus && fallbackStatus !== "unknown") {
-    return { status: fallbackStatus, ok: fallbackStatus !== "broken" };
+    const safeStatus =
+      fallbackStatus === "broken" &&
+      (store === "lider" || store === "unimarc" || store === "tottus" || /lider\.cl|unimarc\.cl|tottus\.cl/i.test(url || ""))
+        ? "protected"
+        : fallbackStatus;
+    return { status: safeStatus, ok: safeStatus !== "broken" };
   }
   return null;
 }
 
-function renderLinkBadge(url, fallbackStatus = null) {
-  const info = getLinkCheckInfo(url, fallbackStatus);
-  if (!info || !url || url === "#") return "";
-  if (info.status === "broken") {
-    return `<span class="link-badge link-broken" title="El supermercado devolvió 404 Not Found o página inexistente">🚫 404 Caído</span>`;
+function renderLinkBadge(url, fallbackStatus = null, lastVerifiedAt = null, store = "") {
+  const info = getLinkCheckInfo(url, fallbackStatus, store);
+  const verIso = info?.verifiedAt || lastVerifiedAt || null;
+  const timeTxt = verIso ? fmtDateShort(verIso) : null;
+
+  if (info?.status === "broken") {
+    return `<span class="link-badge link-broken" title="El supermercado devolvió 404 Not Found o página inexistente">🚫 404 Caído${timeTxt ? ` · ${timeTxt}` : ""}</span>`;
   }
-  if (info.status === "ok") {
-    return `<span class="link-badge link-ok" title="Link verificado HTTP 200 OK en el supermercado">🟢 200 OK</span>`;
+  if (timeTxt) {
+    return `<span class="link-badge link-ok" title="Precio y link verificados el ${timeTxt}">🟢 Chequeado: ${timeTxt}</span>`;
   }
-  if (info.status === "protected") {
-    return `<span class="link-badge link-protected" title="Validado vía API oficial (la web bloquea bots HTTP directos del servidor)">🛡️ Vía API</span>`;
+  if (info?.status === "ok" || info?.status === "protected") {
+    return `<span class="link-badge link-ok" title="Link verificado">🟢 Chequeado</span>`;
   }
-  return "";
+  return `<span class="link-badge link-protected" title="Pendiente de rechequeo manual">⏳ Sin chequear</span>`;
+}
+
+async function recheckAllLinksAndPrices({
+  scope = "all",
+  trackedItemId = null,
+  cartId = null,
+  itemId = null,
+  triggerBtn = null,
+  originalLabel = null,
+} = {}) {
+  if (triggerBtn) {
+    triggerBtn.disabled = true;
+    triggerBtn.textContent = "⏳ Rechequeando precios y links...";
+  }
+  try {
+    const res = await fetch("/api/recheck-links", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ scope, trackedItemId, cartId, itemId }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || "Error al rechequear precios");
+
+    if (data.items) state.trackedItems = data.items;
+    if (data.carts) state.carts = data.carts;
+    renderAll();
+    const upd = data.updatedPricesCount || 0;
+    const tot = data.checkedCount || 0;
+    showToast(
+      upd > 0
+        ? `✅ ${tot} links rechequeados (${fmtDateShort(data.checkedAt)}): ${upd} precio(s) ajustado(s) al valor actual de la web.`
+        : `✅ ${tot} links y precios verificados (${fmtDateShort(data.checkedAt)}): todos calzan con la tienda.`
+    );
+    return data;
+  } catch (err) {
+    showToast("Error al rechequear links y precios: " + err.message);
+  } finally {
+    if (triggerBtn && originalLabel) {
+      triggerBtn.disabled = false;
+      triggerBtn.innerHTML = originalLabel;
+    }
+  }
 }
 
 async function verifyVisibleLinks({ forceAll = false, showToastFeedback = false } = {}) {
@@ -427,7 +507,7 @@ function renderTrackedCards() {
         const isWinner = best && best.store === storeId;
         const vStat = varMap[storeId];
         const deltaPct = vStat?.deltaPrevPct ?? 0;
-        const linkInfo = getLinkCheckInfo(snap.product_url);
+        const linkInfo = getLinkCheckInfo(snap.product_url, snap.link_status, storeId);
         const isBrokenLink = linkInfo?.status === "broken";
 
         let deltaBadge = `<span class="delta-pill delta-same">= 0%</span>`;
@@ -529,11 +609,18 @@ function renderTrackedCards() {
             : "";
 
         const isOutSnap = snap.in_stock === false || snap.stock_status === "out_of_stock";
+        const effectiveStatus = snap.stock_status || (isOutSnap ? "out_of_stock" : "in_stock");
         const stockBadgeHtml = renderStockBadgeHtml(
           snap.in_stock !== false,
-          snap.stock_status || (isOutSnap ? "out_of_stock" : "in_stock"),
+          effectiveStatus,
           snap.store_zone || ""
         );
+        const stockToggleHtml = renderStockToggleButtons({
+          kind: "tracked",
+          itemId: item.id,
+          store: storeId,
+          stockStatus: effectiveStatus,
+        });
 
         return `
           <div class="store-row ${isWinner && !isOutSnap ? "is-cheapest" : ""} ${
@@ -547,8 +634,9 @@ function renderTrackedCards() {
                 <a href="${snap.product_url || "#"}" target="_blank" rel="noopener" title="${snap.product_name}">
                   ${isWinner && !isOutSnap ? "🏆 " : ""}${snap.product_name}
                 </a>
-                ${renderLinkBadge(snap.product_url, snap.link_status)}
+                ${renderLinkBadge(snap.product_url, snap.link_status, snap.last_verified_at || snap.recorded_at, storeId)}
                 ${stockBadgeHtml}
+                ${stockToggleHtml}
               </div>
               <div class="store-row-meta">
                 ${snap.brand ? `<span class="brand-mini-pill">🏷️ ${snap.brand}</span>` : ""}
@@ -792,8 +880,7 @@ function renderTrackedCards() {
       btn.textContent = "⏳";
       try {
         await fetch(`/api/tracked/${id}/refresh`, { method: "POST" });
-        await loadTrackedData();
-        showToast("Precios actualizados y registrados en el historial.");
+        await recheckAllLinksAndPrices({ scope: "tracked", trackedItemId: id });
       } catch (e) {
         showToast("Error al actualizar: " + e.message);
       } finally {
@@ -809,6 +896,32 @@ function renderTrackedCards() {
       await fetch(`/api/tracked/${id}`, { method: "DELETE" });
       await loadTrackedData();
       showToast("Producto eliminado del seguimiento.");
+    });
+  });
+
+  grid.querySelectorAll(".btn-tracked-stock-toggle").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const itemId = Number(btn.dataset.itemId);
+      const store = btn.dataset.store;
+      const stockStatus = btn.dataset.next;
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/tracked/${itemId}/stock`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ store, stockStatus }),
+        });
+        if (res.ok) {
+          await loadTrackedData();
+          showToast(
+            stockStatus === "out_of_stock"
+              ? `${STORE_META[store]?.name || store} marcado sin stock y excluido de ganadores.`
+              : `${STORE_META[store]?.name || store} marcado con stock disponible.`
+          );
+        }
+      } finally {
+        btn.disabled = false;
+      }
     });
   });
 
@@ -1042,6 +1155,11 @@ function renderBasketComparison() {
   const cart = getActiveCart();
   const barsBox = document.getElementById("cartComparisonBarsBox");
   const roadmapProgBox = document.getElementById("roadmapProgressBarBox");
+  const btnRefreshCart = document.getElementById("btnRefreshCart");
+  if (btnRefreshCart && cart) {
+    const refIso = cart.pricesRefreshedAt || cart.updatedAt;
+    btnRefreshCart.title = `Precios actualizados el ${fmtDateShort(refIso)}. Haz clic para reconsultar ofertas en vivo.`;
+  }
 
   if (!cart) {
     if (strategiesGrid) strategiesGrid.innerHTML = `<div class="empty-state">Crea un carrito para empezar a comparar precios.</div>`;
@@ -1236,7 +1354,12 @@ function renderBasketComparison() {
                   : ` · <span style="color:#34d399; font-weight:700;">🚚 Despacho GRATIS</span>`
               }
               <br/>
-              ✅ ${st.inStockFoundCount ?? st.foundCount} de ${st.totalItemsCount} disponibles
+              ✅ ${st.verifiedStockCount ?? st.inStockFoundCount ?? st.foundCount} de ${st.totalItemsCount} con stock confirmado
+              ${
+                st.unverifiedZoneCount > 0
+                  ? `<br/><span style="color:#fbbf24; font-weight:700;">📍 ${st.unverifiedZoneCount} por confirmar en tu comuna</span>`
+                  : ""
+              }
               ${
                 st.outOfStockCount > 0
                   ? `<br/><span style="color:#fca5a5; font-weight:700;">🚫 ${st.outOfStockCount} producto(s) sin stock</span>`
@@ -1372,11 +1495,32 @@ function renderBasketComparison() {
             return `<td class="small-muted"><div>—</div>${liderBtnHtml}</td>`;
           }
 
-          const isBest = bestStore === storeId;
           const p = offer.product;
+          const isOutCell = p.inStock === false || p.stockStatus === "out_of_stock";
+          const cellStatus = p.stockStatus || (isOutCell ? "out_of_stock" : "in_stock");
+          const isBest = bestStore === storeId && !isOutCell;
+          const isManualChosenHere = item.isManualStoreChoice && item.chosenStore === storeId;
           const candidates = offer.candidates || [];
           const effLine = offer.discountedLineTotal ?? offer.lineTotal;
           const hasCardDisc = offer.cardDiscount && offer.cardDiscount.discountPct > 0 && effLine < offer.lineTotal;
+          const qtyEff = offer.qty || item.quantity;
+          const pkgPrice = offer.effectivePackagePrice || p.price;
+          const normalPkg = p.listPrice && p.listPrice > pkgPrice ? p.listPrice : offer.unitPackagePrice || p.price;
+          const savedPerPack = Math.max(0, normalPkg - pkgPrice);
+          const discountPctPack = normalPkg > 0 && savedPerPack > 0 ? Math.round((savedPerPack / normalPkg) * 100) : 0;
+
+          const offerStatusHtml =
+            savedPerPack > 0
+              ? `<div style="font-size:0.73rem; color:#fbbf24; font-weight:700;">🔥 Oferta: Antes <span class="crossed-price">${fmtClp(normalPkg)}</span> (Bajó ${fmtClp(savedPerPack)} / -${discountPctPack}%)</div>`
+              : offer.appliedPromo || p.promoText
+              ? `<div style="font-size:0.73rem; color:#fbbf24; font-weight:700;">🏷️ Oferta: ${offer.promoText || p.promoText}</div>`
+              : `<div style="font-size:0.71rem; color:#64748b;">Precio normal (sin oferta)</div>`;
+
+          const chooseStoreBtnHtml = isManualChosenHere
+            ? `<button type="button" class="btn-choose-store is-chosen" data-item-id="${item.id}" data-store="auto" title="Supermercado elegido por ti para comprar este producto. Haz clic para volver a automático.">✅ Comprando aquí</button>`
+            : isBest
+            ? `<button type="button" class="btn-choose-store is-auto-winner" data-item-id="${item.id}" data-store="${storeId}" title="Ganador automático. Haz clic para fijar este supermercado.">🏆 Mejor opción (Elegir)</button>`
+            : `<button type="button" class="btn-choose-store" data-item-id="${item.id}" data-store="${storeId}" title="Elegir comprar este producto en ${STORE_META[storeId]?.name || storeId} y actualizar el carrito">🛒 Comprar aquí</button>`;
 
           const selectorHtml =
             candidates.length > 1
@@ -1388,7 +1532,13 @@ function renderBasketComparison() {
                       <option value="${c.externalId}" ${
                         String(c.externalId) === String(p.externalId) ? "selected" : ""
                       }>
-                        ${c.name.slice(0, 34)} (${fmtClp(c.price)} · ${fmtUnitScaled(c.unitPrice, c.unit, state.unitScale, c.pricePer10gProtein)})
+                        ${
+                          c.inStock === false || c.stockStatus === "out_of_stock"
+                            ? "🚫 "
+                            : c.stockStatus === "unverified_zone"
+                            ? "📍 "
+                            : ""
+                        }${c.name.slice(0, 32)} (${fmtClp(c.price)} · ${fmtUnitScaled(c.unitPrice, c.unit, state.unitScale, c.pricePer10gProtein)})
                       </option>
                     `
                     )
@@ -1398,20 +1548,16 @@ function renderBasketComparison() {
               : "";
 
           return `
-            <td style="${isBest ? "background:rgba(16,185,129,0.11); border-left:2px solid #10b981;" : ""}">
-              <div style="font-size:0.98rem; font-weight:800; color:${isBest ? "#34d399" : "#f8fafc"};">
-                ${hasCardDisc ? `<span class="crossed-price" style="font-size:0.8rem;">${fmtClp(offer.lineTotal)}</span> ` : ""}${fmtClp(effLine)}
-                ${
-                  (offer.qty || item.quantity) > 1 || offer.isScaledQty
-                    ? `<span class="small-muted" style="font-weight:400;">(${offer.qty || item.quantity} × ${fmtClp(offer.effectivePackagePrice)}${offer.isScaledQty ? " · eq." : ""})</span>`
-                    : ""
-                }
+            <td class="${isOutCell ? "cart-cell-out" : ""}" style="${isBest ? "background:rgba(16,185,129,0.11); border-left:2px solid #10b981;" : ""}">
+              <div style="font-size:0.95rem; font-weight:800; color:${isBest ? "#34d399" : "#f8fafc"};">
+                🛒 Total (${qtyEff} paq.): ${hasCardDisc ? `<span class="crossed-price" style="font-size:0.78rem;">${fmtClp(offer.lineTotal)}</span> ` : ""}${fmtClp(effLine)}
               </div>
-              <div style="font-size:0.78rem; font-weight:600; color:#94a3b8;">
-                ${fmtUnitScaled(p.effectiveUnitPrice || p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)} · 📦 ${p.formatLabel}
+              <div style="font-size:0.76rem; color:#e2e8f0; margin-top:0.15rem;">
+                📦 Paquete (${p.formatLabel || "1 un"}): <strong>${fmtClp(pkgPrice)}</strong> c/u
               </div>
-              <div style="font-size:0.75rem; color:#e2e8f0;">
-                Envase: <strong>${fmtClp(p.price)}</strong>/un${p.bundlePricePerItem && p.bundlePricePerItem < p.price ? ` · <span style="color:#fbbf24; font-weight:700;">🏷️ ${fmtClp(p.bundlePricePerItem)}/un</span>` : ""}
+              ${offerStatusHtml}
+              <div style="font-size:0.76rem; font-weight:600; color:#94a3b8; margin-top:0.1rem;">
+                ⚖️ Precio x unidad: <strong>${fmtUnitScaled(p.effectiveUnitPrice || p.unitPrice, p.unit, state.unitScale, p.pricePer10gProtein)}</strong>
               </div>
               ${
                 hasCardDisc
@@ -1432,8 +1578,15 @@ function renderBasketComparison() {
                 <a href="${p.url || "#"}" target="_blank" rel="noopener" style="color:#cbd5e1; font-size:0.76rem; text-decoration:none;">
                   ${p.name.slice(0, 42)}
                 </a>
-                ${renderLinkBadge(p.url, p.linkStatus)}
-                ${renderStockBadgeHtml(p.inStock, p.stockStatus, p.storeZone)}
+                ${renderLinkBadge(p.url, p.linkStatus, p.lastVerifiedAt, storeId)}
+                ${renderStockBadgeHtml(p.inStock, cellStatus, p.storeZone)}
+                ${renderStockToggleButtons({
+                  kind: "cart",
+                  itemId: item.id,
+                  store: storeId,
+                  externalId: p.externalId,
+                  stockStatus: cellStatus,
+                })}
               </div>
               ${
                 p.pricePer10gProtein
@@ -1451,27 +1604,35 @@ function renderBasketComparison() {
                   ? `<div class="purity-warning-pill ${p.isPure === false ? "is-impure" : "is-blend"}" style="margin-top:0.2rem;">${p.purityWarning}</div>`
                   : ""
               }
-              ${
-                offer.appliedPromo
-                  ? `<div style="font-size:0.7rem; color:#fbbf24; font-weight:700;">🏷️ Promo aplicada: ${offer.promoText}</div>`
-                  : ""
-              }
+              ${chooseStoreBtnHtml}
               ${selectorHtml}
               ${liderBtnHtml}
             </td>
           `;
         }).join("");
 
+        const storeChoiceOptions = [
+          `<option value="auto" ${!item.isManualStoreChoice ? "selected" : ""}>🤖 Automático (${STORE_META[item.autoBestStore]?.name || "Mejor"})</option>`,
+          ...STORE_ORDER.filter((st) => item.storeOffers?.[st]).map((st) => {
+            const stOffer = item.storeOffers[st];
+            const stTot = stOffer.discountedLineTotal ?? stOffer.lineTotal;
+            return `<option value="${st}" ${item.isManualStoreChoice && item.chosenStore === st ? "selected" : ""}>🛒 ${STORE_META[st]?.name}: ${fmtClp(stTot)}</option>`;
+          }),
+        ].join("");
+
         return `
           <tr>
             <td>
               <div style="font-weight:700; font-size:0.92rem;">${item.label}</div>
-              <div style="display:flex; align-items:center; gap:0.5rem; margin-top:0.3rem;">
+              <div style="display:flex; align-items:center; gap:0.4rem; margin-top:0.3rem; flex-wrap:wrap;">
                 <div class="qty-stepper">
                   <button type="button" class="btn-qty-minus" data-item-id="${item.id}" data-qty="${item.quantity}">−</button>
                   <span>${item.quantity} un.</span>
                   <button type="button" class="btn-qty-plus" data-item-id="${item.id}" data-qty="${item.quantity}">+</button>
                 </div>
+                <button type="button" class="btn btn-secondary btn-sm btn-recheck-cart-item" data-item-id="${item.id}" title="Rechequear links y precios reales de este producto ahora">
+                  🔍 Rechequear
+                </button>
                 <button type="button" class="btn btn-danger-ghost btn-remove-cart-item" data-item-id="${item.id}" title="Quitar del carrito">
                   🗑️
                 </button>
@@ -1479,20 +1640,41 @@ function renderBasketComparison() {
             </td>
             ${storeCellsHtml}
             <td>
+              <div style="margin-bottom:0.35rem;">
+                <label class="small-muted" style="display:block; font-size:0.68rem; margin-bottom:0.15rem;">📍 Dónde comprar:</label>
+                <select class="cart-store-choice-select" data-item-id="${item.id}" title="Elige dónde comprar este producto y actualiza todo el carrito">
+                  ${storeChoiceOptions}
+                </select>
+              </div>
               ${
                 bestOffer
-                  ? `
+                  ? (() => {
+                      const bestEffLine = bestOffer.discountedLineTotal ?? bestOffer.lineTotal;
+                      const bestHasDisc = bestEffLine < bestOffer.lineTotal;
+                      const bestOut =
+                        bestOffer.product?.inStock === false ||
+                        bestOffer.product?.stockStatus === "out_of_stock";
+                      const bestPkg = bestOffer.effectivePackagePrice || bestOffer.product.price;
+                      return `
                     <span class="store-badge store-${bestStore}">${STORE_META[bestStore]?.name}</span>
-                    <div style="font-weight:800; color:#34d399; margin-top:0.25rem;">
-                      ${fmtClp(bestOffer.lineTotal)}
+                    ${item.isManualStoreChoice ? `<span class="brand-mini-pill" title="Elegido manualmente por ti">📌 Elegido</span>` : ""}
+                    ${
+                      bestOut
+                        ? `<div style="font-size:0.7rem; color:#fca5a5; font-weight:700; margin-top:0.15rem;">🚫 Sin stock en tiendas</div>`
+                        : ""
+                    }
+                    <div style="font-weight:800; color:${bestOut ? "#fca5a5" : "#34d399"}; margin-top:0.25rem;">
+                      Total: ${bestHasDisc ? `<span class="crossed-price" style="font-size:0.78rem;">${fmtClp(bestOffer.lineTotal)}</span> ` : ""}${fmtClp(bestEffLine)}
                     </div>
-                    <div class="small-muted">${fmtUnitScaled(bestOffer.product.unitPrice, bestOffer.product.unit, state.unitScale, bestOffer.product.pricePer10gProtein)}</div>
+                    <div style="font-size:0.74rem; color:#e2e8f0;">Paquete: ${fmtClp(bestPkg)} c/u</div>
+                    <div class="small-muted">${fmtUnitScaled(bestOffer.product.effectiveUnitPrice || bestOffer.product.unitPrice, bestOffer.product.unit, state.unitScale, bestOffer.product.pricePer10gProtein)}</div>
                     ${
                       item.maxItemSavingsClp > 0
                         ? `<div style="font-size:0.72rem; color:#10b981;">Ahorras ${fmtClp(item.maxItemSavingsClp)} en esta línea</div>`
                         : ""
                     }
-                  `
+                  `;
+                    })()
                   : "—"
               }
             </td>
@@ -1501,7 +1683,47 @@ function renderBasketComparison() {
       })
       .join("");
 
-    // Eventos de cantidad (- / +), eliminación y cambio de marca en el carrito
+    // Eventos de cantidad (- / +), eliminación, rechequeo y elección de tienda en el carrito
+    tbody.querySelectorAll(".btn-recheck-cart-item").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const itemId = Number(btn.dataset.itemId);
+        await recheckAllLinksAndPrices({
+          scope: "cart",
+          cartId: cart.id,
+          itemId,
+          triggerBtn: btn,
+          originalLabel: "🔍 Rechequear",
+        });
+      });
+    });
+
+    const updateChosenStoreForItem = async (itemId, chosenStore) => {
+      const res = await fetch(`/api/carts/${cart.id}/items/${itemId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ chosenStore }),
+      });
+      const data = await res.json();
+      if (data.carts) state.carts = data.carts;
+      renderAll();
+      showToast(
+        chosenStore === "auto"
+          ? "Selección de tienda devuelta a modo automático."
+          : `Producto asignado a ${STORE_META[chosenStore]?.name || chosenStore} y carrito actualizado.`
+      );
+    };
+
+    tbody.querySelectorAll(".cart-store-choice-select").forEach((sel) => {
+      sel.addEventListener("change", () => {
+        updateChosenStoreForItem(Number(sel.dataset.itemId), sel.value);
+      });
+    });
+
+    tbody.querySelectorAll(".btn-choose-store").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        updateChosenStoreForItem(Number(btn.dataset.itemId), btn.dataset.store);
+      });
+    });
     tbody.querySelectorAll(".btn-qty-minus").forEach((btn) => {
       btn.addEventListener("click", async () => {
         const itemId = Number(btn.dataset.itemId);
@@ -1568,6 +1790,33 @@ function renderBasketComparison() {
         openCartLiderUpdateModal(cart.id, btn.dataset.itemId, btn.dataset.label);
       });
     });
+
+    tbody.querySelectorAll(".btn-cart-stock-toggle").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const itemId = Number(btn.dataset.itemId);
+        const store = btn.dataset.store;
+        const externalId = btn.dataset.extId || "";
+        const stockStatus = btn.dataset.next;
+        btn.disabled = true;
+        try {
+          const res = await fetch(`/api/carts/${cart.id}/items/${itemId}/stock`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ store, externalId, stockStatus }),
+          });
+          const data = await res.json();
+          if (data.carts) state.carts = data.carts;
+          renderAll();
+          showToast(
+            stockStatus === "out_of_stock"
+              ? `Marcado sin stock en ${STORE_META[store]?.name || store} y recalculado el ganador.`
+              : `Stock confirmado en ${STORE_META[store]?.name || store}.`
+          );
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
   }
 
   // 4. Renderizar Hoja de Ruta y Checklist de Súper (Modo Pasillo con localStorage)
@@ -1613,19 +1862,40 @@ function renderBasketComparison() {
               .map((it) => {
                 const cKey = `${group.store}:${it.itemId}`;
                 const isDone = checkedSet.has(cKey);
+                const qty = it.qty || it.quantity || 1;
+                const pkgPrice = it.effectivePackagePrice || it.unitPackagePrice || Math.round((it.lineTotal || 0) / qty);
+                const normalPkg = it.normalPackagePrice || pkgPrice;
+                const savedPerPack = Math.max(0, normalPkg - pkgPrice);
+                const discountPct = normalPkg > 0 && savedPerPack > 0 ? Math.round((savedPerPack / normalPkg) * 100) : 0;
+                const offerLineHtml =
+                  savedPerPack > 0
+                    ? `<span style="color:#fbbf24; font-weight:700;">🔥 En Oferta: Antes <span class="crossed-price">${fmtClp(normalPkg)}</span> (Bajó ${fmtClp(savedPerPack)} c/u · -${discountPct}%)</span>`
+                    : it.appliedPromo || it.promoText
+                    ? `<span style="color:#fbbf24; font-weight:700;">🏷️ Oferta: ${it.appliedPromo || it.promoText}</span>`
+                    : `<span style="color:#64748b;">Precio normal (sin oferta)</span>`;
+
                 return `
                 <li>
-                  <label class="checklist-row ${isDone ? "is-checked" : ""}" style="width:100%;">
-                    <input type="checkbox" class="checklist-item-cb" data-ckey="${cKey}" ${isDone ? "checked" : ""} />
+                  <label class="checklist-row ${isDone ? "is-checked" : ""}" style="width:100%; align-items:flex-start;">
+                    <input type="checkbox" class="checklist-item-cb" data-ckey="${cKey}" ${isDone ? "checked" : ""} style="margin-top:0.25rem;" />
                     <div class="checklist-text" style="flex:1;">
-                      <strong>${it.qty || it.quantity}×</strong>
-                      <a href="${it.url || "#"}" target="_blank" rel="noopener" style="color:#f1f5f9;">
-                        ${it.productName}
-                      </a>
-                      <span class="small-muted">(${fmtUnitScaled(it.unitPrice, it.unit, state.unitScale, it.pricePer10gProtein)})</span>
-                      ${it.cardBadge ? `<span class="brand-mini-pill">💳 ${it.cardBadge}</span>` : ""}
+                      <div style="display:flex; align-items:center; gap:0.35rem; flex-wrap:wrap;">
+                        <strong>${qty}×</strong>
+                        <a href="${it.url || "#"}" target="_blank" rel="noopener" style="color:#f1f5f9; font-weight:700;">
+                          ${it.productName}
+                        </a>
+                        ${it.isManualStoreChoice ? `<span class="brand-mini-pill">📌 Elegido por ti</span>` : ""}
+                        ${renderLinkBadge(it.url, it.linkStatus, it.lastVerifiedAt, group.store)}
+                      </div>
+                      <div class="roadmap-price-breakdown">
+                        <div>📦 <strong>Precio paquete (${it.formatLabel || "1 un"}):</strong> ${fmtClp(pkgPrice)} c/u</div>
+                        <div>🏷️ <strong>Estado oferta:</strong> ${offerLineHtml}</div>
+                        <div>⚖️ <strong>Precio x unidad:</strong> ${fmtUnitScaled(it.effectiveUnitPrice || it.unitPrice, it.unit, state.unitScale, it.pricePer10gProtein)}</div>
+                        <div>🛒 <strong>Precio total (${qty} × ${fmtClp(pkgPrice)}):</strong> <strong style="color:#34d399;">${fmtClp(it.lineTotal)}</strong></div>
+                      </div>
+                      ${it.cardBadge ? `<div style="margin-top:0.2rem;"><span class="brand-mini-pill">💳 ${it.cardBadge}</span></div>` : ""}
                     </div>
-                    <strong class="checklist-text" style="white-space:nowrap;">${fmtClp(it.lineTotal)}</strong>
+                    <strong class="checklist-text" style="white-space:nowrap; font-size:1rem; color:#34d399;">${fmtClp(it.lineTotal)}</strong>
                   </label>
                 </li>
               `;
@@ -1738,9 +2008,10 @@ async function executeLiveSearch(query) {
   }
 }
 
-function renderSearchProductCard(p, idx, bestUnitPrice) {
+function renderSearchProductCard(p, idx, bestUnitPrice, requireConfirmedStock = false) {
   const isOut = p.inStock === false || p.stockStatus === "out_of_stock";
-  const isBest = !isOut && bestUnitPrice > 0 && p.unitPrice === bestUnitPrice;
+  const allowBest = !isOut && (!requireConfirmedStock || p.stockStatus === "in_stock");
+  const isBest = allowBest && bestUnitPrice > 0 && p.unitPrice === bestUnitPrice;
   const discountPct =
     p.listPrice && p.listPrice > p.price
       ? Math.round(((p.listPrice - p.price) / p.listPrice) * 100)
@@ -2018,7 +2289,16 @@ function renderLiveSearchResults() {
     return;
   }
 
+  const getTier = (p) =>
+    p.inStock === false || p.stockStatus === "out_of_stock"
+      ? 2
+      : p.stockStatus === "unverified_zone"
+      ? 1
+      : 0;
+
   filtered.sort((a, b) => {
+    const tierDiff = getTier(a) - getTier(b);
+    if (tierDiff !== 0) return tierDiff;
     if (sortMode === "unit_asc") return a.unitPrice - b.unitPrice;
     if (sortMode === "protein_asc") {
       return (a.pricePer10gProtein || 9999999) - (b.pricePer10gProtein || 9999999);
@@ -2048,8 +2328,11 @@ function renderLiveSearchResults() {
     }
   });
 
+  const confirmedEntries = availEntries.filter(({ p }) => p.stockStatus === "in_stock");
+  const hasConfirmedStock = confirmedEntries.length > 0;
+  const bestPool = hasConfirmedStock ? confirmedEntries : availEntries;
   const bestUnitPrice =
-    availEntries.length > 0 ? Math.min(...availEntries.map(({ p }) => p.unitPrice)) : 0;
+    bestPool.length > 0 ? Math.min(...bestPool.map(({ p }) => p.unitPrice)) : 0;
 
   const outSectionHtml =
     outEntries.length > 0
@@ -2057,7 +2340,7 @@ function renderLiveSearchResults() {
         <section class="out-of-stock-section">
           <h4>🚫 Productos Sin Stock / Agotados (${outEntries.length})</h4>
           <div class="search-results-grid">
-            ${outEntries.map(({ p, idx }) => renderSearchProductCard(p, idx, 0)).join("")}
+            ${outEntries.map(({ p, idx }) => renderSearchProductCard(p, idx, 0, hasConfirmedStock)).join("")}
           </div>
         </section>
       `
@@ -2130,7 +2413,7 @@ function renderLiveSearchResults() {
                       </div>
                     </div>
                     <div class="search-results-grid">
-                      ${entries.map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice)).join("")}
+                      ${entries.map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice, hasConfirmedStock)).join("")}
                     </div>
                   </section>
                 `;
@@ -2144,7 +2427,7 @@ function renderLiveSearchResults() {
       const availGrid =
         availEntries.length > 0
           ? `<div class="search-results-grid">${availEntries
-              .map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice))
+              .map(({ p, idx }) => renderSearchProductCard(p, idx, bestUnitPrice, hasConfirmedStock))
               .join("")}</div>`
           : `<div class="empty-state">No hay productos con stock en esta selección.</div>`;
       container.innerHTML = availGrid + outSectionHtml;
@@ -2615,6 +2898,77 @@ async function configureDynamicBookmarklet() {
       if (!raw) {
         raw = cartItems.length > 0 ? document.body.innerText.slice(0, 120000) : document.documentElement.outerHTML;
       }
+      var payloadObj = {
+        mode: isCart ? "cart" : "auto",
+        rawContent: raw,
+        cartItems: cartItems,
+        browserItems: browserItems,
+        storeZone: storeZone,
+        url: location.href,
+      };
+      var payloadJson = JSON.stringify(payloadObj);
+      var copyFallback = function (text) {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          try { navigator.clipboard.writeText(text).catch(function () {}); } catch (ec) {}
+        }
+        try {
+          var ta = document.createElement("textarea");
+          ta.value = text;
+          ta.style.cssText = "position:fixed;left:-9999px;top:-9999px;";
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          document.execCommand("copy");
+          ta.remove();
+        } catch (ec2) {}
+      };
+      var needsBridge =
+        location.protocol === "https:" &&
+        orig.indexOf("http://") === 0 &&
+        orig.indexOf("http://localhost") !== 0 &&
+        orig.indexOf("http://127.0.0.1") !== 0;
+
+      if (needsBridge) {
+        copyFallback(payloadJson);
+        var bridgeWin = window.open(orig + "/?bridge=1", "superprecio_bridge");
+        if (!bridgeWin || bridgeWin.closed) {
+          alert("El navegador bloqueó la pestaña puente a " + orig + ". Los datos ya se copiaron al portapapeles: abre SuperPrecio CL en Tab 5 -> 'Pegar del Portapapeles', o permite pop-ups para este sitio.");
+          return;
+        }
+        var payloadMsg = { type: "SP_BRIDGE_IMPORT", endpoint: ep, payload: payloadObj };
+        var acked = false;
+        var sendTimer = null;
+        var onMsg = function (ev) {
+          if (!ev || !ev.data) return;
+          if (ev.data.type === "SP_BRIDGE_READY" && (ev.source === bridgeWin || ev.origin === orig)) {
+            try { bridgeWin.postMessage(payloadMsg, orig); } catch (pmErr) {}
+          } else if (ev.data.type === "SP_BRIDGE_ACK" && (ev.source === bridgeWin || ev.origin === orig)) {
+            acked = true;
+            if (sendTimer) clearInterval(sendTimer);
+            window.removeEventListener("message", onMsg);
+          }
+        };
+        window.addEventListener("message", onMsg);
+        var tries = 0;
+        sendTimer = setInterval(function () {
+          tries++;
+          if (acked || tries > 50 || bridgeWin.closed) {
+            clearInterval(sendTimer);
+            window.removeEventListener("message", onMsg);
+            return;
+          }
+          try { bridgeWin.postMessage(payloadMsg, orig); } catch (pmErr) {}
+        }, 250);
+        try { bridgeWin.postMessage(payloadMsg, orig); } catch (pmErr0) {}
+        var toastB = document.createElement("div");
+        toastB.style.cssText =
+          "position:fixed;top:20px;right:20px;z-index:999999;background:#2563eb;color:#fff;padding:14px 20px;border-radius:10px;font-family:sans-serif;font-weight:bold;box-shadow:0 10px 25px rgba(0,0,0,0.4);max-width:360px;";
+        toastB.textContent = "🌉 Abriendo SuperPrecio CL para recibir tus productos (respaldo copiado al portapapeles)...";
+        document.body.appendChild(toastB);
+        setTimeout(function () { toastB.remove(); }, 6000);
+        return;
+      }
+
       var xhr = new XMLHttpRequest();
       xhr.open("POST", ep, true);
       xhr.setRequestHeader("Content-Type", "application/json");
@@ -2649,22 +3003,97 @@ async function configureDynamicBookmarklet() {
       xhr.onerror = function () {
         alert("Error conectando a SuperPrecio CL en " + orig);
       };
-      xhr.send(
-        JSON.stringify({
-          mode: isCart ? "cart" : "auto",
-          rawContent: raw,
-          cartItems: cartItems,
-          browserItems: browserItems,
-          storeZone: storeZone,
-          url: location.href,
-        })
-      );
+      xhr.send(payloadJson);
     } catch (e) {
       alert("Error: " + e.message);
     }
   };
 
   linkEl.href = `javascript:(${bookmarkletFn.toString()})(${JSON.stringify(endpoint)},${JSON.stringify(origin)});`;
+}
+
+let bridgeHandled = false;
+
+async function handleImportedResponseData(data) {
+  await loadTrackedData();
+  if (data.isCartImport && data.cartId) {
+    state.activeCartId = data.cartId;
+    renderAll();
+    switchTab("tab-basket");
+    showToast(`🛒 Carrito importado (${data.importedItemsCount || data.count || 0} prod.) y cotizado en los 5 supermercados.`);
+  } else {
+    renderAll();
+    showToast(`✅ Importados ${data.count || 1} producto(s)${data.matchedTrackedCount ? ` (${data.matchedTrackedCount} seguimientos act.)` : ""}.`);
+  }
+}
+
+function initBookmarkletBridgeReceiver() {
+  const isBridgeParam = new URLSearchParams(window.location.search).get("bridge") === "1";
+
+  window.addEventListener("message", async (ev) => {
+    if (!ev?.data || ev.data.type !== "SP_BRIDGE_IMPORT" || bridgeHandled) return;
+    const isTrustedStore =
+      ev.origin === window.location.origin ||
+      /^https?:\/\/(?:[a-z0-9-]+\.)?(?:lider|tottus|jumbo|santaisabel|sisa|unimarc)\.cl$/i.test(ev.origin);
+    if (!isTrustedStore || !ev.data.payload) return;
+
+    bridgeHandled = true;
+    try {
+      ev.source?.postMessage({ type: "SP_BRIDGE_ACK" }, ev.origin);
+    } catch {}
+
+    if (isBridgeParam) {
+      try {
+        history.replaceState(null, "", "/");
+      } catch {}
+    }
+
+    showToast("⏳ Recibiendo datos del navegador y cotizando en supermercados...");
+    try {
+      let postPath = "/api/import-lider";
+      if (ev.data.endpoint) {
+        try {
+          const epUrl = new URL(ev.data.endpoint, window.location.origin);
+          postPath = epUrl.pathname + epUrl.search;
+        } catch {}
+      }
+      const res = await fetch(postPath, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(ev.data.payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Error al importar datos del puente");
+      await handleImportedResponseData(data);
+    } catch (err) {
+      showToast("❌ Error en puente de importación: " + err.message);
+    }
+  });
+
+  if (isBridgeParam) {
+    const pingParent = () => {
+      try {
+        window.opener?.postMessage({ type: "SP_BRIDGE_READY" }, "*");
+      } catch {}
+    };
+    pingParent();
+    setTimeout(pingParent, 250);
+    setTimeout(pingParent, 700);
+
+    // Respaldo si window.opener quedó aislado por el sitio de origen
+    setTimeout(() => {
+      if (bridgeHandled) return;
+      try {
+        history.replaceState(null, "", "/");
+      } catch {}
+      switchTab("tab-links");
+      const det = document.getElementById("liderPasteDetails");
+      if (det) det.open = true;
+      const ta = document.getElementById("liderRawTextarea");
+      if (ta) ta.focus();
+      showToast("📋 Si el navegador bloqueó el puente directo, presiona 'Pegar del Portapapeles e Importar' o Ctrl+V en Tab 5.");
+    }, 3000);
+  }
 }
 
 async function bootApp() {
@@ -2693,6 +3122,7 @@ async function bootApp() {
 // --- Inicialización de Eventos DOM ---
 
 window.addEventListener("DOMContentLoaded", () => {
+  initBookmarkletBridgeReceiver();
   bootApp();
 
   // Formulario de Login (cuando ACCESS_PASSWORD está configurada en la nube)
@@ -2781,14 +3211,26 @@ window.addEventListener("DOMContentLoaded", () => {
       btn.innerHTML = `<span class="icon">⏳</span> Actualizando todos...`;
       try {
         await fetch("/api/tracked/refresh-all", { method: "POST" });
-        await loadTrackedData();
-        showToast("Todos los productos fueron actualizados y guardados en el historial.");
+        await recheckAllLinksAndPrices({ scope: "all" });
       } catch (err) {
         showToast("Error al actualizar: " + err.message);
       } finally {
         btn.disabled = false;
         btn.innerHTML = `<span class="icon">🔄</span> Actualizar Todos Ahora`;
       }
+    });
+  }
+
+  // Botón Rechequear Links y Precios Global
+  const btnRecheckAllLinks = document.getElementById("btnRecheckAllLinks");
+  if (btnRecheckAllLinks) {
+    btnRecheckAllLinks.addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      await recheckAllLinksAndPrices({
+        scope: "all",
+        triggerBtn: btn,
+        originalLabel: `<span class="icon">🔍</span> Rechequear Links y Precios`,
+      });
     });
   }
 
@@ -2920,12 +3362,26 @@ window.addEventListener("DOMContentLoaded", () => {
         const res = await fetch(`/api/carts/${cart.id}/refresh`, { method: "POST" });
         const data = await res.json();
         if (data.carts) state.carts = data.carts;
-        renderAll();
-        showToast("Precios del carrito actualizados en vivo.");
+        await recheckAllLinksAndPrices({ scope: "cart", cartId: cart.id });
       } finally {
         btn.disabled = false;
         btn.textContent = "🔄 Actualizar Precios";
       }
+    });
+  }
+
+  const btnRecheckCartLinks = document.getElementById("btnRecheckCartLinks");
+  if (btnRecheckCartLinks) {
+    btnRecheckCartLinks.addEventListener("click", async (e) => {
+      const cart = getActiveCart();
+      if (!cart) return;
+      const btn = e.currentTarget;
+      await recheckAllLinksAndPrices({
+        scope: "cart",
+        cartId: cart.id,
+        triggerBtn: btn,
+        originalLabel: "🔍 Rechequear Links y Precios",
+      });
     });
   }
 
@@ -3193,14 +3649,11 @@ window.addEventListener("DOMContentLoaded", () => {
   // Botón Verificar Links en vivo
   document.getElementById("btnVerifyTrackedLinks")?.addEventListener("click", async (e) => {
     const btn = e.currentTarget;
-    btn.disabled = true;
-    btn.textContent = "⏳ Verificando...";
-    try {
-      await verifyVisibleLinks({ forceAll: true, showToastFeedback: true });
-    } finally {
-      btn.disabled = false;
-      btn.textContent = "🔗 Verificar Links";
-    }
+    await recheckAllLinksAndPrices({
+      scope: "all",
+      triggerBtn: btn,
+      originalLabel: "🔗 Verificar Links",
+    });
   });
 
   // Modal Nuevo Producto Seguido
@@ -3505,6 +3958,24 @@ window.addEventListener("DOMContentLoaded", () => {
     } finally {
       btn.disabled = false;
       btn.textContent = "🟦 Procesar e Importar Contenido de Lider";
+    }
+  });
+
+  document.getElementById("btnPasteImportClipboard")?.addEventListener("click", async () => {
+    const ta = document.getElementById("liderRawTextarea");
+    const btnImport = document.getElementById("btnImportLiderRaw");
+    if (!ta || !btnImport) return;
+    try {
+      const clipText = await navigator.clipboard.readText();
+      if (!clipText || !clipText.trim()) {
+        showToast("El portapapeles está vacío. Haz clic primero en el Bookmarklet en Lider/Tottus o copia el contenido.");
+        return;
+      }
+      ta.value = clipText.trim();
+      btnImport.click();
+    } catch {
+      ta.focus();
+      showToast("Tu navegador pide pegado manual: presiona Ctrl+V en el cuadro de texto y luego 'Procesar e Importar'.");
     }
   });
 });

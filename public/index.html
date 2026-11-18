@@ -39,6 +39,10 @@
           <span class="icon">🔄</span> Actualizar Todos Ahora
         </button>
 
+        <button id="btnRecheckAllLinks" class="btn btn-accent" title="Rechequea cada link en vivo y sincroniza el precio real de la ficha / API en la base de datos">
+          <span class="icon">🔍</span> Rechequear Links y Precios
+        </button>
+
         <a href="/api/export.csv" class="btn btn-secondary" download>
           <span class="icon">📥</span> Exportar CSV / Excel
         </a>
@@ -229,7 +233,10 @@
           <button type="button" id="btnRefreshCart" class="btn btn-primary btn-sm">
             🔄 Actualizar Precios
           </button>
-          <button type="button" id="btnCopyCartSummary" class="btn btn-accent btn-sm">
+          <button type="button" id="btnRecheckCartLinks" class="btn btn-accent btn-sm" title="Rechequea cada link del carrito y actualiza los precios reales de cada producto">
+            🔍 Rechequear Links y Precios
+          </button>
+          <button type="button" id="btnCopyCartSummary" class="btn btn-secondary btn-sm">
             📋 Copiar Lista Óptima
           </button>
         </div>
@@ -282,11 +289,11 @@
           <div class="setting-block">
             <label><strong>💳 Mis Tarjetas y Membresías Activas:</strong></label>
             <div class="cards-checkboxes-row" id="cartProgramsCheckboxes">
-              <label class="checkbox-chip"><input type="checkbox" value="cmr" checked /> <span>CMR Falabella</span></label>
-              <label class="checkbox-chip"><input type="checkbox" value="cencosud" checked /> <span>Cencosud Scotiabank / Prime</span></label>
-              <label class="checkbox-chip"><input type="checkbox" value="unimarc_club" checked /> <span>Club Unimarc</span></label>
-              <label class="checkbox-chip"><input type="checkbox" value="lider_bci" checked /> <span>Tarjeta Lider Bci</span></label>
-              <label class="checkbox-chip"><input type="checkbox" value="banco_estado" checked /> <span>BancoEstado / Cuenta RUT / Tenpo</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="cmr" /> <span>CMR Falabella</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="cencosud" /> <span>Cencosud Scotiabank / Prime</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="unimarc_club" /> <span>Club Unimarc</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="lider_bci" /> <span>Tarjeta Lider Bci</span></label>
+              <label class="checkbox-chip"><input type="checkbox" value="banco_estado" /> <span>BancoEstado / Cuenta RUT / Tenpo</span></label>
             </div>
           </div>
         </div>
@@ -386,7 +393,7 @@
                 <th>Unimarc</th>
                 <th>Tottus</th>
                 <th>Lider</th>
-                <th>🏆 Mejor Opción</th>
+                <th>🏆 Dónde Comprar / Mejor Opción</th>
               </tr>
             </thead>
             <tbody></tbody>
@@ -660,14 +667,14 @@
           <div class="bookmarklet-instructions">
             <h4>¿Cómo se usa? (Apuntando automáticamente a <code id="bookmarkletOriginCode">este servidor</code>)</h4>
             <ol>
-              <li>Arrastra el botón verde de arriba a tu barra de marcadores de Chrome o Edge (o vuelve a arrastrarlo si actualizaste la app).</li>
-              <li>Abre <code>www.lider.cl/cart</code> (para importar tu <strong>carrito completo de 1 clic</strong>), una búsqueda en Lider o una ficha de producto <code>/ip/</code>.</li>
-              <li>Haz clic en el marcador <strong>"🛒 Importar a SuperPrecio CL"</strong> en tu barra de favoritos.</li>
+              <li>Arrastra el botón verde de arriba a tu barra de marcadores de Chrome o Edge (vuelve a arrastrarlo después de cambios de URL).</li>
+              <li>Abre <code>www.lider.cl/cart</code> (para importar tu <strong>carrito completo de 1 clic</strong>), una búsqueda en Lider/Tottus o una ficha de producto <code>/ip/</code>.</li>
+              <li>Haz clic en el marcador <strong>"🛒 Importar a SuperPrecio CL"</strong> en tu barra de favoritos. Si usas IP HTTP sin HTTPS, abrirá esta app en una pestaña puente (recuerda permitir pop-ups la primera vez) y también copiará un respaldo al portapapeles.</li>
               <li>¡Listo! En modo carrito creará un Carrito Comparativo en Tab 2 cotizando tus mismos productos y cantidades en Jumbo, Santa Isabel, Unimarc y Tottus.</li>
             </ol>
           </div>
 
-          <details class="lider-paste-details" style="margin-top: 0.9rem;">
+          <details id="liderPasteDetails" class="lider-paste-details" style="margin-top: 0.9rem;">
             <summary>📋 <strong>Plan B Manual: Pegar contenido/JSON/Markdown de Lider.cl (Búsqueda o /cart)</strong></summary>
             <div class="stack-form" style="margin-top: 0.75rem;">
               <div class="form-row-2">
@@ -691,9 +698,12 @@
                   placeholder="Pega aquí texto copiado de lider.cl/cart, HTML con __NEXT_DATA__, o JSON del carrito..."
                 ></textarea>
               </div>
-              <div style="display:flex; gap:0.75rem; align-items:center;">
+              <div style="display:flex; gap:0.75rem; align-items:center; flex-wrap:wrap;">
                 <button type="button" class="btn btn-primary btn-sm" id="btnImportLiderRaw">
                   🟦 Procesar e Importar Contenido de Lider
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" id="btnPasteImportClipboard">
+                  📋 Pegar del Portapapeles e Importar
                 </button>
                 <span id="liderImportResultBox" class="small-muted"></span>
               </div>
