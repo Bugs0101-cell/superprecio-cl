@@ -11,7 +11,7 @@ import {
   checkProductPurity,
   extractQuantityFromText,
 } from "./normalizer.mjs";
-import { searchAllStores, STORES } from "./scrapers.mjs";
+import { fetchProductByUrl, searchAllStores, STORES } from "./scrapers.mjs";
 import { formatPriceAlertMessage, sendTelegramNotification } from "./telegram.mjs";
 
 const AUTO_STORES = ["jumbo", "santaisabel", "unimarc", "tottus"];
@@ -60,12 +60,21 @@ export async function refreshTrackedItem(trackedItemId) {
         includeOutOfStock: true,
       });
 
-      const match =
-        res.products.find(
-          (p) =>
-            String(p.externalId) === String(pinned.external_id) ||
-            String(p.sku) === String(pinned.sku)
-        ) || res.products[0];
+      let match = res.products.find(
+        (p) =>
+          String(p.externalId) === String(pinned.external_id) ||
+          String(p.sku) === String(pinned.sku)
+      );
+
+      if (!match && pinned.url && ["jumbo", "santaisabel"].includes(pinned.store)) {
+        try {
+          match = await fetchProductByUrl(pinned.url);
+        } catch {}
+      }
+
+      if (!match) {
+        match = res.products[0];
+      }
 
       if (match) {
         const snapRes = touchOrInsertSnapshot({

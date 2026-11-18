@@ -18,22 +18,35 @@ import {
 const URL_CHECK_CACHE = new Map();
 const URL_CACHE_TTL_MS = 30 * 60 * 1000;
 
-export async function verifyProductUrl(rawUrl, store = "") {
+export async function verifyProductUrl(rawUrl, store = "", { force = false } = {}) {
+  const verifiedAt = new Date().toISOString();
   const url = normalizeProductUrl(rawUrl, store);
   if (!url || !/^https?:\/\//i.test(url)) {
-    return { ok: false, status: "broken", httpStatus: 0, url: "" };
+    return { ok: false, status: "broken", httpStatus: 0, url: "", verifiedAt };
   }
 
-  const cached = URL_CHECK_CACHE.get(url);
-  if (cached && Date.now() - cached.checkedAt < URL_CACHE_TTL_MS) {
-    return cached.result;
+  if (!force) {
+    const cached = URL_CHECK_CACHE.get(url);
+    if (cached && Date.now() - cached.checkedAt < URL_CACHE_TTL_MS) {
+      return cached.result;
+    }
   }
 
   const recordResult = (result) => {
+    const withTime = { verifiedAt, ...result };
     if (URL_CHECK_CACHE.size > 600) URL_CHECK_CACHE.clear();
-    URL_CHECK_CACHE.set(url, { checkedAt: Date.now(), result });
-    return result;
+    URL_CHECK_CACHE.set(url, { checkedAt: Date.now(), result: withTime });
+    return withTime;
   };
+
+  // Unimarc y Lider usan WAF (Akamai / PerimeterX que redirige a /blocked con HTTP 404 en servidor aunque el link funcione en navegador)
+  if (
+    store === "unimarc" ||
+    store === "lider" ||
+    /unimarc\.cl|lider\.cl/i.test(url)
+  ) {
+    return recordResult({ ok: true, status: "protected", httpStatus: 200, url, verifiedAt });
+  }
 
   try {
     const res = await fetch(url, {
@@ -48,13 +61,16 @@ export async function verifyProductUrl(rawUrl, store = "") {
     });
 
     if (res.status === 404 || res.status === 410) {
-      return recordResult({ ok: false, status: "broken", httpStatus: res.status, url });
+      return recordResult({ ok: false, status: "broken", httpStatus: res.status, url, verifiedAt });
     }
 
     if (res.status >= 300 && res.status < 400) {
       const loc = res.headers.get("location") || "";
+      if (/\/blocked|queue-it|challenge|captcha|perimeterx/i.test(loc)) {
+        return recordResult({ ok: true, status: "protected", httpStatus: 200, url, verifiedAt });
+      }
       if (/\/404(?:$|[/?#])/i.test(loc)) {
-        return recordResult({ ok: false, status: "broken", httpStatus: 404, url });
+        return recordResult({ ok: false, status: "broken", httpStatus: 404, url, verifiedAt });
       }
       if (loc) {
         const nextUrl = loc.startsWith("http") ? loc : new URL(loc, url).href;
@@ -65,35 +81,42 @@ export async function verifyProductUrl(rawUrl, store = "") {
           signal: AbortSignal.timeout(4000),
         });
         if (r2.status === 404 || r2.status === 410) {
-          return recordResult({ ok: false, status: "broken", httpStatus: r2.status, url });
+          return recordResult({ ok: false, status: "broken", httpStatus: r2.status, url, verifiedAt });
         }
         if (r2.status === 200) {
-          return recordResult({ ok: true, status: "ok", httpStatus: 200, url: nextUrl });
+          const fullHtml2 = await r2.text();
+          let liveOffer = null;
+          if (store === "santaisabel" || store === "jumbo") {
+            liveOffer = extractCencosudPdpLiveOffer(fullHtml2, store, nextUrl);
+          }
+          return recordResult({ ok: true, status: "ok", httpStatus: 200, url: nextUrl, liveOffer, verifiedAt });
         }
       }
     }
 
     if (res.status === 403 || res.status === 412 || res.status === 429) {
-      return recordResult({ ok: true, status: "protected", httpStatus: res.status, url });
+      return recordResult({ ok: true, status: "protected", httpStatus: res.status, url, verifiedAt });
     }
 
     if (res.status === 200) {
-      const snippet = (await res.text()).slice(0, 12000);
-      if (
-        /robot or human|perimeterx|px-captcha/i.test(snippet) &&
-        store === "lider"
-      ) {
-        return recordResult({ ok: true, status: "protected", httpStatus: 200, url });
+      const fullHtml = await res.text();
+      const snippet = fullHtml.slice(0, 12000);
+      if (/robot or human|perimeterx|px-captcha/i.test(snippet)) {
+        return recordResult({ ok: true, status: "protected", httpStatus: 200, url, verifiedAt });
       }
       if (/<title>[^<]*404|p[áa]gina\s+no\s+encontrada|product(?:o)?\s+no\s+(?:encontrado|disponible)/i.test(snippet)) {
-        return recordResult({ ok: false, status: "broken", httpStatus: 404, url });
+        return recordResult({ ok: false, status: "broken", httpStatus: 404, url, verifiedAt });
       }
-      return recordResult({ ok: true, status: "ok", httpStatus: 200, url });
+      let liveOffer = null;
+      if (store === "santaisabel" || store === "jumbo") {
+        liveOffer = extractCencosudPdpLiveOffer(fullHtml, store, url);
+      }
+      return recordResult({ ok: true, status: "ok", httpStatus: 200, url, liveOffer, verifiedAt });
     }
 
-    return recordResult({ ok: true, status: "unknown", httpStatus: res.status, url });
+    return recordResult({ ok: true, status: "unknown", httpStatus: res.status, url, verifiedAt });
   } catch {
-    return recordResult({ ok: true, status: "unknown", httpStatus: 0, url });
+    return recordResult({ ok: true, status: "unknown", httpStatus: 0, url, verifiedAt });
   }
 }
 
@@ -199,6 +222,360 @@ function parseCencosudSkuData(data) {
   }
 }
 
+function extractBalancedObject(str, startIdx) {
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = startIdx; i < str.length; i++) {
+    const ch = str[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === "\\") {
+      esc = true;
+      continue;
+    }
+    if (ch === '"') {
+      inStr = !inStr;
+      continue;
+    }
+    if (inStr) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}" && --depth === 0) {
+      return str.slice(startIdx, i + 1);
+    }
+  }
+  return null;
+}
+
+function extractNextFlightFullText(html) {
+  if (!html || typeof html !== "string") return "";
+  const chunks = [];
+  for (const m of html.matchAll(/self\.__next_f\.push\(\[\d+,"((?:[^"\\]|\\.)*)"\]\)/g)) {
+    try {
+      chunks.push(JSON.parse('"' + m[1] + '"'));
+    } catch {}
+  }
+  return chunks.join("\n");
+}
+
+function parseCencosudLiveItemOffer(item) {
+  if (!item) return null;
+  const price = toClp(item.price);
+  if (!price) return null;
+
+  let listPrice = toClp(item.listPrice);
+  if (listPrice !== undefined && listPrice <= price) listPrice = undefined;
+
+  const pillName =
+    typeof item.pill === "object" && item.pill?.name
+      ? String(item.pill.name).trim()
+      : null;
+  const isAgotadoPill = Boolean(pillName && /agotado/i.test(pillName));
+  const inStock = item.stock !== false && !isAgotadoPill;
+  const stockStatus = inStock ? "in_stock" : "out_of_stock";
+
+  let bundleText = null;
+  let bundlePricePerItem = null;
+  let memberPrice = null;
+  let memberPromoNote = null;
+
+  const promos = Array.isArray(item.promotions) ? item.promotions : [];
+  for (const pr of promos) {
+    if (!pr || typeof pr !== "object") continue;
+    const pay = String(pr.paymentMethods || "ALL").toUpperCase();
+    const isCardOnly = /CENCOSUD/.test(pay) && pay !== "ALL";
+    const mQty = Number(pr.mQuantity) || 0;
+    const prUnit = toClp(pr.unitPrice);
+    const prTotal = toClp(pr.val ?? pr.value) || (prUnit && mQty > 1 ? prUnit * mQty : undefined);
+
+    if (!isCardOnly) {
+      if (pr.type === "mx" && mQty > 1 && prTotal && prUnit && prUnit < price && !bundlePricePerItem) {
+        bundlePricePerItem = prUnit;
+        bundleText = `${mQty} x $${prTotal}`;
+      }
+    } else {
+      if (pr.type === "nominal" && prUnit && prUnit < price && (!memberPrice || prUnit < memberPrice)) {
+        memberPrice = prUnit;
+      } else if (pr.type === "mx" && mQty > 1 && prTotal && !memberPromoNote) {
+        memberPromoNote = `Tarjeta Cencosud ${mQty} x $${prTotal}`;
+      }
+    }
+  }
+
+  const promoParts = [];
+  if (bundleText) promoParts.push(bundleText);
+  if (pillName && !isAgotadoPill && !promoParts.includes(pillName)) promoParts.push(pillName);
+  if (memberPromoNote) promoParts.push(memberPromoNote);
+  if (promoParts.length === 0 && (listPrice || promos.length > 0)) {
+    promoParts.push("Oferta");
+  }
+
+  return {
+    skuId: String(item.skuId || ""),
+    name: item.name ? String(item.name).trim() : "",
+    price,
+    listPrice: listPrice ?? null,
+    memberPrice,
+    promoText: promoParts.length > 0 ? promoParts.join(" · ") : null,
+    bundlePricePerItem,
+    hasPromotions: promos.length > 0,
+    inStock,
+    stockStatus,
+    storeUnit: item.measurementUnitUn ? normalizeUnit(item.measurementUnitUn) : undefined,
+    storeMultiplier: typeof item.unitMultiplierUn === "number" ? item.unitMultiplierUn : undefined,
+    imageUrl: Array.isArray(item.images) ? item.images[0] || "" : "",
+  };
+}
+
+function extractCencosudFlightEntries(html) {
+  const full = extractNextFlightFullText(html);
+  if (!full) return [];
+  const entries = [];
+  const seen = new Set();
+  const token = '"product":{"productId":';
+  let pos = 0;
+
+  while (true) {
+    const idx = full.indexOf(token, pos);
+    if (idx < 0) break;
+    const objStr = extractBalancedObject(full, idx + '"product":'.length);
+    pos = idx + token.length;
+    if (!objStr) continue;
+    try {
+      const prodObj = JSON.parse(objStr);
+      const firstItem = prodObj?.items?.[0];
+      const offer = parseCencosudLiveItemOffer(firstItem);
+      if (!offer || !offer.skuId || seen.has(offer.skuId)) continue;
+      seen.add(offer.skuId);
+      entries.push({
+        ...offer,
+        productId: String(prodObj.productId || offer.skuId),
+        reference: prodObj.reference ? String(prodObj.reference) : offer.skuId,
+        slug: prodObj.slug ? String(prodObj.slug) : "",
+        brand: prodObj.brand ? String(prodObj.brand) : "",
+        name: offer.name || prodObj.name || prodObj.slug?.replace(/-/g, " ") || "",
+      });
+    } catch {}
+  }
+
+  return entries;
+}
+
+function extractCencosudPdpLiveOffer(html, storeId, pageUrl = "") {
+  if (!html) return null;
+  let ldProduct = null;
+  for (const m of html.matchAll(LD_JSON_REGEX)) {
+    try {
+      const parsed = JSON.parse(m[1]);
+      const arr = Array.isArray(parsed) ? parsed : [parsed];
+      const hit = arr.find((x) => x && x["@type"] === "Product");
+      if (hit) {
+        ldProduct = hit;
+        break;
+      }
+    } catch {}
+  }
+
+  const flightFull = extractNextFlightFullText(html);
+  const targetSku = ldProduct?.sku ? String(ldProduct.sku) : null;
+  let flightOffer = null;
+
+  if (flightFull) {
+    // Buscar el objeto items:[{skuId:...}] correspondiente al producto de la PDP
+    const skuNeedle = targetSku ? `"skuId":"${targetSku}"` : '"skuId":"';
+    let pos = 0;
+    while (true) {
+      const idx = flightFull.indexOf(skuNeedle, pos);
+      if (idx < 0) break;
+      const braceStart = flightFull.lastIndexOf("{", idx);
+      if (braceStart >= 0 && idx - braceStart < 40) {
+        const objStr = extractBalancedObject(flightFull, braceStart);
+        if (objStr) {
+          try {
+            const itemObj = JSON.parse(objStr);
+            const parsedOffer = parseCencosudLiveItemOffer(itemObj);
+            if (parsedOffer && (!targetSku || parsedOffer.skuId === targetSku)) {
+              if (
+                !flightOffer ||
+                (parsedOffer.hasPromotions && !flightOffer.hasPromotions) ||
+                (parsedOffer.listPrice && !flightOffer.listPrice)
+              ) {
+                flightOffer = parsedOffer;
+              }
+              if (flightOffer.hasPromotions && flightOffer.listPrice) break;
+            }
+          } catch {}
+        }
+      }
+      pos = idx + skuNeedle.length;
+    }
+  }
+
+  if (flightOffer) {
+    return {
+      ...flightOffer,
+      brand: ldProduct?.brand?.name || "",
+      name: flightOffer.name || ldProduct?.name || "",
+      url: normalizeProductUrl(ldProduct?.url || pageUrl, storeId),
+    };
+  }
+
+  if (ldProduct?.offers) {
+    const offerObj = Array.isArray(ldProduct.offers) ? ldProduct.offers[0] : ldProduct.offers;
+    const ldPrice = toClp(offerObj?.price);
+    if (ldPrice) {
+      const availStr = String(offerObj?.availability || "");
+      const inStock = !/OutOfStock/i.test(availStr);
+      return {
+        skuId: targetSku || "",
+        name: ldProduct.name || "",
+        brand: ldProduct.brand?.name || "",
+        price: ldPrice,
+        listPrice: null,
+        memberPrice: null,
+        promoText: null,
+        bundlePricePerItem: null,
+        inStock,
+        stockStatus: inStock ? "in_stock" : "out_of_stock",
+        url: normalizeProductUrl(ldProduct.url || pageUrl, storeId),
+      };
+    }
+  }
+
+  return null;
+}
+
+function applyCencosudLiveOffer(prod, liveOffer, { preserveStoreStock = false } = {}) {
+  if (!prod || !liveOffer || !(liveOffer.price > 0)) return prod;
+  const oldPrice = prod.price;
+  const nextPrice = liveOffer.price;
+  let nextListPrice =
+    liveOffer.listPrice && liveOffer.listPrice > nextPrice
+      ? liveOffer.listPrice
+      : prod.listPrice && prod.listPrice > nextPrice
+      ? prod.listPrice
+      : oldPrice > nextPrice
+      ? oldPrice
+      : null;
+
+  const nextUnitMetrics = enrichUnitMetrics({
+    price: nextPrice,
+    storeUnit: prod.unit,
+    storeMultiplier: prod.baseAmount > 0 ? prod.baseAmount : undefined,
+    name: prod.name,
+    description: "",
+  });
+
+  const bundlePrice = liveOffer.bundlePricePerItem ?? prod.bundlePricePerItem ?? null;
+  const nextEffUnit =
+    bundlePrice && nextUnitMetrics.baseAmount > 0
+      ? Math.round(bundlePrice / nextUnitMetrics.baseAmount)
+      : nextUnitMetrics.unitPrice;
+
+  const nextBrand = prod.brand || liveOffer.brand || "";
+  const nutFields = resolveBrandAndNutrition(prod.name, nextBrand, nextUnitMetrics, nextPrice);
+
+  const nextInStock = preserveStoreStock ? prod.inStock : liveOffer.inStock;
+  const nextStockStatus = preserveStoreStock
+    ? prod.stockStatus
+    : liveOffer.stockStatus || (nextInStock ? "in_stock" : "out_of_stock");
+
+  const prodHasBundle = prod.promoText && parseBundle(prod.promoText)?.type === "bundle";
+  const liveHasBundle = liveOffer.promoText && parseBundle(liveOffer.promoText)?.type === "bundle";
+  const mergedPromoText =
+    liveHasBundle || !prodHasBundle
+      ? liveOffer.promoText || prod.promoText || (nextListPrice ? "Oferta" : null)
+      : prod.promoText;
+
+  return {
+    ...prod,
+    price: nextPrice,
+    listPrice: nextListPrice,
+    memberPrice: liveOffer.memberPrice ?? prod.memberPrice ?? null,
+    promoText: mergedPromoText,
+    bundlePricePerItem: bundlePrice,
+    unit: nextUnitMetrics.unit,
+    unitPrice: nextUnitMetrics.unitPrice,
+    effectiveUnitPrice: nextEffUnit,
+    baseAmount: nextUnitMetrics.baseAmount,
+    formatLabel: nextUnitMetrics.formatLabel,
+    pricePer100: nextUnitMetrics.pricePer100,
+    per100UnitName: nextUnitMetrics.per100UnitName,
+    pricePerSmallUnit: nextUnitMetrics.pricePerSmallUnit,
+    smallUnitName: nextUnitMetrics.smallUnitName,
+    ...nutFields,
+    inStock: nextInStock,
+    stockStatus: nextStockStatus,
+  };
+}
+
+function buildCencosudProductFromLiveEntry(cfg, entry) {
+  const unitMetrics = enrichUnitMetrics({
+    price: entry.price,
+    storeUnit: entry.storeUnit,
+    storeMultiplier: entry.storeMultiplier,
+    name: entry.name,
+    description: "",
+  });
+  const effectiveUnitPrice =
+    entry.bundlePricePerItem && unitMetrics.baseAmount > 0
+      ? Math.round(entry.bundlePricePerItem / unitMetrics.baseAmount)
+      : unitMetrics.unitPrice;
+  const rawUrl = entry.slug ? `${cfg.siteBaseUrl}/${entry.slug}/p` : cfg.siteBaseUrl;
+  const nutFields = resolveBrandAndNutrition(entry.name, entry.brand, unitMetrics, entry.price);
+
+  return {
+    store: cfg.storeId,
+    storeName: STORES[cfg.storeId].name,
+    externalId: String(entry.skuId),
+    sku: String(entry.reference || entry.skuId),
+    name: String(entry.name).trim(),
+    price: entry.price,
+    listPrice: entry.listPrice ?? null,
+    memberPrice: entry.memberPrice ?? null,
+    promoText: entry.promoText || (entry.listPrice ? "Oferta" : null),
+    bundlePricePerItem: entry.bundlePricePerItem ?? null,
+    unit: unitMetrics.unit,
+    unitPrice: unitMetrics.unitPrice,
+    effectiveUnitPrice,
+    baseAmount: unitMetrics.baseAmount,
+    formatLabel: unitMetrics.formatLabel,
+    pricePer100: unitMetrics.pricePer100,
+    per100UnitName: unitMetrics.per100UnitName,
+    pricePerSmallUnit: unitMetrics.pricePerSmallUnit,
+    smallUnitName: unitMetrics.smallUnitName,
+    ...nutFields,
+    imageUrl: entry.imageUrl || "",
+    url: normalizeProductUrl(rawUrl, cfg.storeId),
+    inStock: entry.inStock,
+    stockStatus: entry.stockStatus,
+    storeZone: "",
+    availableStores: [],
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+async function fetchCencosudLiveSearch(cfg, query) {
+  try {
+    const searchUrl = `${cfg.siteBaseUrl}/busca?ft=${encodeURIComponent(query)}`;
+    const res = await fetch(searchUrl, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "es-CL,es;q=0.9",
+      },
+      signal: AbortSignal.timeout(5500),
+    });
+    if (!res.ok) return [];
+    const html = await res.text();
+    return extractCencosudFlightEntries(html);
+  } catch {
+    return [];
+  }
+}
+
 export async function searchCencosud(storeId, query, limit = 18, options = {}) {
   const cfg = CENCOSUD_CONFIGS[storeId];
   if (!cfg) throw new Error(`Banner Cencosud desconocido: ${storeId}`);
@@ -213,30 +590,65 @@ export async function searchCencosud(storeId, query, limit = 18, options = {}) {
     _dt: String(Date.now()),
   });
 
-  if (storeId === "jumbo" && options.jumboStore) {
+  const hasJumboStoreFilter = Boolean(storeId === "jumbo" && options.jumboStore);
+  if (hasJumboStoreFilter) {
     params.append("filters[SellerVSS]", String(options.jumboStore).trim());
   }
 
-  const url = `https://${cfg.host}/search/${encodeURIComponent(query)}?${params.toString()}`;
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent": USER_AGENT,
-      Accept: "application/json",
-      "Accept-Language": "es-CL,es;q=0.9",
-    },
-    signal: AbortSignal.timeout(10000),
-  });
+  const cnUrl = `https://${cfg.host}/search/${encodeURIComponent(query)}?${params.toString()}`;
+  const [cnRes, liveEntries] = await Promise.all([
+    fetch(cnUrl, {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "application/json",
+        "Accept-Language": "es-CL,es;q=0.9",
+      },
+      signal: AbortSignal.timeout(10000),
+    }).catch((err) => ({ ok: false, _err: err })),
+    fetchCencosudLiveSearch(cfg, query),
+  ]);
 
-  if (!res.ok) {
-    throw new Error(`${STORES[storeId].name} HTTP ${res.status}`);
+  if (!cnRes.ok && liveEntries.length === 0) {
+    throw new Error(
+      cnRes._err ? cnRes._err.message : `${STORES[storeId].name} HTTP ${cnRes.status}`
+    );
   }
 
-  const json = await res.json();
-  const results = json?.response?.results ?? [];
+  let mapped = [];
+  if (cnRes.ok) {
+    const json = await cnRes.json();
+    const results = json?.response?.results ?? [];
+    mapped = results
+      .map((r) => mapCencosudItem(cfg, r, options.jumboStore || ""))
+      .filter(Boolean);
+  }
 
-  const mapped = results
-    .map((r) => mapCencosudItem(cfg, r, options.jumboStore || ""))
-    .filter(Boolean);
+  if (liveEntries.length > 0) {
+    const liveBySkuId = new Map();
+    const liveByRef = new Map();
+    for (const le of liveEntries) {
+      if (le.skuId) liveBySkuId.set(le.skuId, le);
+      if (le.reference) liveByRef.set(le.reference, le);
+    }
+
+    const seenIds = new Set();
+    mapped = mapped.map((prod) => {
+      seenIds.add(prod.externalId);
+      const liveMatch = liveBySkuId.get(prod.externalId) || liveByRef.get(prod.sku);
+      return liveMatch
+        ? applyCencosudLiveOffer(prod, liveMatch, { preserveStoreStock: hasJumboStoreFilter })
+        : prod;
+    });
+
+    if (!hasJumboStoreFilter) {
+      for (const le of liveEntries) {
+        if (mapped.length >= limit) break;
+        if (seenIds.has(le.skuId)) continue;
+        seenIds.add(le.skuId);
+        mapped.push(buildCencosudProductFromLiveEntry(cfg, le));
+      }
+    }
+  }
 
   return options.includeOutOfStock === false
     ? mapped.filter((item) => item.inStock)
@@ -378,22 +790,30 @@ function mapUnimarcItem(p, isAvailableList = true) {
   if (listPrice !== undefined && listPrice <= price) listPrice = undefined;
 
   const ppu = parseUnitPriceString(priceInfo.ppum);
-  const tag = p?.priceDetail?.promotionalTag?.text;
-  const isClub = typeof tag === "string" && /club/i.test(tag);
+  const tag = p?.priceDetail?.promotionalTag?.text
+    ? String(p.priceDetail.promotionalTag.text).trim()
+    : null;
+  const isClub = Boolean(tag && /club/i.test(tag));
   const memberPrice = isClub ? price : null;
 
   const promo = p?.promotion;
+  const pdPromoMsg =
+    p?.priceDetail?.promotionType === "mx$" && p?.priceDetail?.discountPrice
+      ? String(p.priceDetail.discountPrice).trim()
+      : null;
   const promoDesc =
     promo?.hasSavings && promo?.descriptionMessage
       ? promo.descriptionMessage
-      : isClub
-      ? tag
-      : listPrice
-      ? "Oferta"
-      : null;
+      : pdPromoMsg || tag || (listPrice ? "Oferta" : null);
 
   const bundle = promoDesc ? parseBundle(promoDesc) : undefined;
-  const bundleUnitPrice = promo?.price ?? bundle?.unitPriceInBundle ?? null;
+  const rawPromoUnit =
+    promo?.hasSavings && Number(promo?.price) > 0 ? Math.round(Number(promo.price)) : null;
+  const bundleUnitPrice =
+    (rawPromoUnit && rawPromoUnit < price ? rawPromoUnit : null) ??
+    (bundle?.unitPriceInBundle && bundle.unitPriceInBundle < price
+      ? bundle.unitPriceInBundle
+      : null);
 
   const unitMetrics = enrichUnitMetrics({
     price,
@@ -543,11 +963,7 @@ function mapTottusItem(p) {
     /agotad|sin stock/i.test(badgeText);
 
   const inStock = !explicitOut;
-  const stockStatus = explicitOut
-    ? "out_of_stock"
-    : hasZoneAvailability
-    ? "in_stock"
-    : "unverified_zone";
+  const stockStatus = explicitOut ? "out_of_stock" : "in_stock";
 
   return {
     store: "tottus",
@@ -1137,7 +1553,9 @@ export async function searchAllStores(query, options = {}) {
         }
         const enriched = items.map((item) => {
           if (item.store === "jumbo" && Array.isArray(item.availableStores)) {
-            for (const sv of item.availableStores) discoveredJumboSet.add(sv);
+            for (const sv of item.availableStores) {
+              if (sv && String(sv).trim()) discoveredJumboSet.add(String(sv).trim());
+            }
           }
           const purity = checkProductPurity(query, item.name, item.brand);
           const candText = `${item.name} ${item.brand || ""} ${item.formatLabel || ""}`;
@@ -1174,15 +1592,26 @@ export async function searchAllStores(query, options = {}) {
               const chk = await verifyProductUrl(p.url, p.store);
               p.linkStatus = chk.status;
               p.linkHttpStatus = chk.httpStatus;
+              p.lastVerifiedAt = chk.verifiedAt || new Date().toISOString();
+              p.priceVerified = true;
               if (chk.url) p.url = chk.url;
+              if (chk.liveOffer && (storeId === "santaisabel" || storeId === "jumbo")) {
+                const updated = applyCencosudLiveOffer(p, chk.liveOffer, {
+                  preserveStoreStock: storeId === "jumbo" && Boolean(jumboStore),
+                });
+                Object.assign(p, updated);
+              }
             })
           );
           if (!options.keepBrokenLinks) {
             finalItems = finalItems.filter((p) => p.linkStatus !== "broken");
           }
         } else {
+          const nowIso = new Date().toISOString();
           for (const p of finalItems) {
-            if (!p.linkStatus) p.linkStatus = storeId === "tottus" ? "protected" : "unknown";
+            if (!p.linkStatus) p.linkStatus = storeId === "tottus" || storeId === "lider" ? "protected" : "unknown";
+            if (!p.lastVerifiedAt) p.lastVerifiedAt = nowIso;
+            if (p.priceVerified === undefined) p.priceVerified = storeId !== "lider";
           }
         }
 
@@ -1205,11 +1634,15 @@ export async function searchAllStores(query, options = {}) {
     })
   );
 
-  // Ordenar poniendo primero productos con stock y luego por mejor precio por unidad
+  const getStockTier = (p) => {
+    if (p.inStock === false || p.stockStatus === "out_of_stock") return 2;
+    if (p.stockStatus === "unverified_zone") return 1;
+    return 0;
+  };
+
+  // Ordenar: 0 = Stock confirmado, 1 = Stock sin validar en comuna (Tottus API), 2 = Agotado
   allProducts.sort(
-    (a, b) =>
-      (a.inStock === false ? 1 : 0) - (b.inStock === false ? 1 : 0) ||
-      a.unitPrice - b.unitPrice
+    (a, b) => getStockTier(a) - getStockTier(b) || a.unitPrice - b.unitPrice
   );
 
   // Detectar Falsos Packs Ahorro entre los resultados encontrados
@@ -1248,6 +1681,24 @@ export async function fetchProductByUrl(rawUrl) {
     throw new Error(
       `Dominio "${host}" no reconocido. Usa links de Jumbo, Santa Isabel, Unimarc o Tottus.`
     );
+  }
+
+  // En Jumbo / Santa Isabel podemos leer directo la ficha PDP con precio y promo en vivo
+  if (storeId === "santaisabel" || storeId === "jumbo") {
+    try {
+      const chk = await verifyProductUrl(rawUrl, storeId);
+      if (chk.ok && chk.liveOffer?.price > 0 && chk.liveOffer?.name) {
+        const mappedLive = buildCencosudProductFromLiveEntry(CENCOSUD_CONFIGS[storeId], {
+          ...chk.liveOffer,
+          skuId: chk.liveOffer.skuId || `pdp-${Date.now()}`,
+          reference: chk.liveOffer.skuId || "",
+          slug: "",
+        });
+        mappedLive.url = normalizeProductUrl(chk.url || rawUrl, storeId);
+        mappedLive.linkStatus = "ok";
+        return mappedLive;
+      }
+    } catch {}
   }
 
   // Extraer palabras clave o ID desde el pathname
@@ -1295,4 +1746,181 @@ export async function fetchProductByUrl(rawUrl) {
 
   res.products.sort((a, b) => b.relevance - a.relevance);
   return res.products[0];
+}
+
+// --- 7. Rechequeo en Vivo de Link y Precio de un Producto Específico ---
+
+export async function recheckLiveProductOffer(product, { force = true } = {}) {
+  const verifiedAt = new Date().toISOString();
+  if (!product || !product.store) {
+    return {
+      ok: false,
+      linkStatus: "broken",
+      verifiedAt,
+      priceChanged: false,
+      oldPrice: 0,
+      newPrice: 0,
+      product,
+    };
+  }
+
+  const store = product.store;
+  const oldPrice = Number(product.price) || 0;
+  const updated = {
+    ...product,
+    url: normalizeProductUrl(product.url || "", store),
+    lastVerifiedAt: verifiedAt,
+  };
+
+  try {
+    if (store === "santaisabel" || store === "jumbo") {
+      if (updated.url) {
+        const chk = await verifyProductUrl(updated.url, store, { force });
+        updated.linkStatus = chk.status || "ok";
+        updated.linkHttpStatus = chk.httpStatus || 200;
+        if (chk.url) updated.url = chk.url;
+
+        if (chk.liveOffer?.price > 0) {
+          const merged = applyCencosudLiveOffer(updated, chk.liveOffer);
+          Object.assign(updated, merged, {
+            linkStatus: chk.status || "ok",
+            lastVerifiedAt: chk.verifiedAt || verifiedAt,
+            priceVerified: true,
+          });
+          return {
+            ok: chk.status !== "broken",
+            linkStatus: updated.linkStatus,
+            verifiedAt: updated.lastVerifiedAt,
+            priceChanged: updated.price !== oldPrice,
+            oldPrice,
+            newPrice: updated.price,
+            product: updated,
+          };
+        }
+      }
+
+      // Fallback al catálogo SSR en vivo de Cencosud si la URL no entregó liveOffer o tenía un slug antiguo
+      if (updated.name) {
+        const cfg = CENCOSUD_CONFIGS[store];
+        const liveEntries = await fetchCencosudLiveSearch(cfg, updated.name);
+        const matchedOffer =
+          liveEntries.find(
+            (entry) =>
+              (updated.externalId && String(entry.skuId) === String(updated.externalId)) ||
+              (updated.sku && String(entry.reference) === String(updated.sku)) ||
+              (updated.externalId && String(entry.reference) === String(updated.externalId)) ||
+              (updated.url && entry.slug && updated.url.includes(entry.slug))
+          ) ||
+          liveEntries
+            .map((entry) => ({ entry, score: matchScore(updated.name, entry.name) }))
+            .filter((x) => x.score >= 0.72)
+            .sort((a, b) => b.score - a.score)[0]?.entry;
+
+        if (matchedOffer && matchedOffer.price > 0) {
+          const merged = applyCencosudLiveOffer(updated, matchedOffer);
+          if (matchedOffer.slug) {
+            merged.url = normalizeProductUrl(`${cfg.siteBaseUrl}/${matchedOffer.slug}/p`, store);
+          }
+          Object.assign(updated, merged, {
+            linkStatus: "ok",
+            lastVerifiedAt: verifiedAt,
+            priceVerified: true,
+          });
+        }
+      }
+      return {
+        ok: updated.linkStatus !== "broken",
+        linkStatus: updated.linkStatus || "ok",
+        verifiedAt,
+        priceChanged: updated.price !== oldPrice,
+        oldPrice,
+        newPrice: updated.price,
+        product: updated,
+      };
+    }
+
+    if (store === "unimarc" || store === "tottus") {
+      updated.linkStatus = "protected";
+      const searchQ = buildCrossStoreSearchQuery(updated.name || "") || updated.name || "";
+      if (searchQ) {
+        const liveList =
+          store === "unimarc"
+            ? await searchUnimarc(searchQ, 12)
+            : await searchTottus(searchQ, 12);
+
+        const match =
+          liveList.find(
+            (p) =>
+              (updated.externalId && String(p.externalId) === String(updated.externalId)) ||
+              (updated.sku && String(p.sku) === String(updated.sku)) ||
+              (updated.url && p.url && normalizeProductUrl(p.url, store) === updated.url)
+          ) ||
+          liveList
+            .map((p) => ({ p, score: matchScore(updated.name, p.name) }))
+            .filter((x) => x.score >= 0.72)
+            .sort((a, b) => b.score - a.score)[0]?.p;
+
+        if (match && match.price > 0) {
+          updated.price = match.price;
+          updated.listPrice = match.listPrice ?? null;
+          updated.promoText = match.promoText ?? null;
+          updated.bundlePricePerItem = match.bundlePricePerItem ?? null;
+          updated.unitPrice = match.unitPrice || updated.unitPrice;
+          updated.effectiveUnitPrice = match.effectiveUnitPrice || match.unitPrice || updated.effectiveUnitPrice;
+          updated.inStock = match.inStock !== false;
+          updated.stockStatus =
+            updated.stockStatus === "out_of_stock"
+              ? "out_of_stock"
+              : match.inStock === false
+              ? "out_of_stock"
+              : "in_stock";
+          if (match.url) updated.url = match.url;
+          updated.priceVerified = true;
+        }
+      }
+      return {
+        ok: true,
+        linkStatus: "protected",
+        verifiedAt,
+        priceChanged: updated.price !== oldPrice,
+        oldPrice,
+        newPrice: updated.price,
+        product: updated,
+      };
+    }
+
+    if (store === "lider") {
+      updated.linkStatus = "protected";
+      updated.priceVerified = Boolean(updated.priceVerified ?? true);
+      return {
+        ok: true,
+        linkStatus: "protected",
+        verifiedAt,
+        priceChanged: false,
+        oldPrice,
+        newPrice: updated.price,
+        product: updated,
+      };
+    }
+
+    return {
+      ok: true,
+      linkStatus: updated.linkStatus || "ok",
+      verifiedAt,
+      priceChanged: false,
+      oldPrice,
+      newPrice: updated.price,
+      product: updated,
+    };
+  } catch {
+    return {
+      ok: true,
+      linkStatus: store === "lider" || store === "unimarc" || store === "tottus" ? "protected" : updated.linkStatus || "unknown",
+      verifiedAt,
+      priceChanged: false,
+      oldPrice,
+      newPrice: updated.price,
+      product: updated,
+    };
+  }
 }

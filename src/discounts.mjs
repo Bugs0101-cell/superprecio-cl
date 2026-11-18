@@ -177,14 +177,15 @@ export function calculateDiscountedPricing({
   price,
   memberPrice,
   category = null,
-  activePrograms = ["cmr", "cencosud", "unimarc_club", "lider_bci"],
+  activePrograms = [],
   dayOfWeek = getTodayDayIndex(),
+  hasStoreOffer = false,
 }) {
   const activeSet = new Set(activePrograms);
   let effectivePrice = price;
   const appliedDiscounts = [];
 
-  // 1. Descuentos de Membresía / Socio
+  // 1. Descuentos de Membresía / Socio explícitos del catálogo
   if (memberPrice && memberPrice < price) {
     let qualifiesForMemberPrice = false;
     if (store === "tottus" && activeSet.has("cmr")) qualifiesForMemberPrice = true;
@@ -198,8 +199,8 @@ export function calculateDiscountedPricing({
     }
   }
 
-  // 2. Descuentos por Calendario del Día (respetando restricción por categoría si la regla la tiene)
-  const dayRules = WEEKDAY_RULES[dayOfWeek] || [];
+  // 2. Descuentos por Calendario del Día (no acumulables sobre ofertas/promociones de tienda)
+  const dayRules = !hasStoreOffer ? WEEKDAY_RULES[dayOfWeek] || [] : [];
   let bestAfterRule = effectivePrice;
   let bestRuleLabel = null;
   for (const rule of dayRules) {

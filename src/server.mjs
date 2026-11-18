@@ -13,8 +13,10 @@ import {
   getTrackedItemById,
   insertSnapshot,
   listTrackedItems,
+  recheckTrackedLinksAndPrices,
   removePinnedProduct,
   setSetting,
+  setTrackedStoreStockStatus,
   touchOrInsertSnapshot,
   updateTrackedItem,
 } from "./db.mjs";
@@ -25,9 +27,12 @@ import {
   getCartById,
   importCartFromLiderItems,
   listCarts,
+  recheckCartLinksAndPrices,
+  refreshAllCarts,
   refreshCartPrices,
   removeCartItem,
   seedDefaultCartIfNeeded,
+  setCartItemStoreStockStatus,
   syncBrowserOffersToCarts,
   updateCartCriteria,
   updateCartItem,
@@ -199,6 +204,7 @@ function parseShoppingListLines(text) {
 
 // --- Programador automático en segundo plano (Scheduler) ---
 let autoTimer = null;
+let isAutoRunActive = false;
 
 function setupAutoScheduler() {
   if (autoTimer) {
@@ -209,13 +215,21 @@ function setupAutoScheduler() {
   if (minutes > 0 && Number.isFinite(minutes)) {
     const ms = Math.max(minutes, 5) * 60 * 1000;
     autoTimer = setInterval(async () => {
+      if (isAutoRunActive) return;
+      isAutoRunActive = true;
       console.log(
-        `[Auto-Tracker] Ejecutando actualización programada (${new Date().toISOString()})...`
+        `[Auto-Tracker] Ejecutando actualización programada de seguidos y carritos (${new Date().toISOString()})...`
       );
       try {
         await refreshAllTrackedItems();
+        await refreshAllCarts();
+        await recheckTrackedLinksAndPrices();
+        await recheckCartLinksAndPrices();
+        setSetting("last_cart_auto_run_at", new Date().toISOString());
       } catch (err) {
         console.error("[Auto-Tracker] Error:", err.message);
+      } finally {
+        isAutoRunActive = false;
       }
     }, ms);
   }
@@ -285,16 +299,34 @@ const server = http.createServer(async (req, res) => {
       }
       const body = await readJsonBody(req);
       let cartItems = Array.isArray(body.cartItems) ? body.cartItems : [];
-      const browserItems = Array.isArray(body.browserItems) ? body.browserItems : [];
-      if (cartItems.length === 0 && browserItems.length === 0 && typeof body.rawContent === "string") {
-        const trimmedRaw = body.rawContent.trim();
+      let browserItems = Array.isArray(body.browserItems) ? body.browserItems : [];
+      let rawContent = typeof body.rawContent === "string" ? body.rawContent : "";
+      let storeZone = body.storeZone || "";
+      let importUrl = body.url || "";
+      let importMode = body.mode || "";
+      let importCartName = body.cartName || "";
+
+      if (cartItems.length === 0 && browserItems.length === 0 && rawContent) {
+        const trimmedRaw = rawContent.trim();
         if (trimmedRaw.startsWith("{") || trimmedRaw.startsWith("[")) {
           try {
             const parsedJson = JSON.parse(trimmedRaw);
             if (Array.isArray(parsedJson) && parsedJson.some((x) => x?.name)) {
               cartItems = parsedJson;
-            } else if (Array.isArray(parsedJson?.cartItems)) {
-              cartItems = parsedJson.cartItems;
+            } else if (parsedJson && typeof parsedJson === "object") {
+              if (Array.isArray(parsedJson.browserItems) && parsedJson.browserItems.length > 0) {
+                browserItems = parsedJson.browserItems;
+              }
+              if (Array.isArray(parsedJson.cartItems) && parsedJson.cartItems.length > 0) {
+                cartItems = parsedJson.cartItems;
+              }
+              if (typeof parsedJson.rawContent === "string") {
+                rawContent = parsedJson.rawContent;
+              }
+              if (parsedJson.storeZone && !storeZone) storeZone = parsedJson.storeZone;
+              if (parsedJson.url && !importUrl) importUrl = parsedJson.url;
+              if (parsedJson.mode && (!importMode || importMode === "auto")) importMode = parsedJson.mode;
+              if (parsedJson.cartName && !importCartName) importCartName = parsedJson.cartName;
             }
           } catch {}
         }
@@ -303,17 +335,17 @@ const server = http.createServer(async (req, res) => {
       const products =
         browserItems.length > 0
           ? parseStoreBrowserPayload({
-              rawContent: body.rawContent || "",
+              rawContent,
               cartItems,
               browserItems,
-              url: body.url || "",
-              storeZone: body.storeZone || "",
+              url: importUrl,
+              storeZone,
             })
           : parseLiderCartPayload({
-              rawContent: body.rawContent || "",
+              rawContent,
               cartItems,
-              url: body.url || "",
-              storeZone: body.storeZone || "",
+              url: importUrl,
+              storeZone,
             });
 
       if (products.length === 0) {
@@ -327,8 +359,8 @@ const server = http.createServer(async (req, res) => {
       syncBrowserOffersToCarts(products);
 
       const isCartMode =
-        body.mode === "cart" ||
-        String(body.url || "").includes("/cart") ||
+        importMode === "cart" ||
+        String(importUrl || "").includes("/cart") ||
         cartItems.length > 0 ||
         products.some((p) => Number(p.cartQuantity) > 0);
 
@@ -338,7 +370,7 @@ const server = http.createServer(async (req, res) => {
       if (isCartMode && !body.trackedItemId) {
         const cartRes = await importCartFromLiderItems({
           name:
-            body.cartName ||
+            importCartName ||
             `🟦 Carrito Lider (${new Date().toLocaleDateString("es-CL")})`,
           items: products,
         });
@@ -456,16 +488,56 @@ const server = http.createServer(async (req, res) => {
     // Verificador en vivo de links de productos (detecta 404 vs 200 OK vs Antibot)
     if (pathname === "/api/verify-links" && method === "POST") {
       const body = await readJsonBody(req);
-      const links = Array.isArray(body.links) ? body.links.slice(0, 60) : [];
+      const links = Array.isArray(body.links) ? body.links.slice(0, 80) : [];
+      const force = Boolean(body.force);
       const results = {};
       await Promise.all(
         links.map(async (entry) => {
           const key = entry?.key || entry?.url;
           if (!key || !entry?.url) return;
-          results[key] = await verifyProductUrl(entry.url, entry.store || "");
+          results[key] = await verifyProductUrl(entry.url, entry.store || "", { force });
         })
       );
       return sendJson(res, 200, { results });
+    }
+
+    // Rechequeo profundo y sincronización en BD de cada link y precio real de las fichas / APIs
+    if (pathname === "/api/recheck-links" && method === "POST") {
+      const body = await readJsonBody(req);
+      const scope = body.scope || "all";
+      const checkedAt = new Date().toISOString();
+      let trackedStats = null;
+      let cartStats = null;
+
+      if (scope === "all" || scope === "tracked") {
+        trackedStats = await recheckTrackedLinksAndPrices(body.trackedItemId || null);
+      }
+      if (scope === "all" || scope === "cart") {
+        cartStats = await recheckCartLinksAndPrices(
+          body.cartId || null,
+          body.itemId || null
+        );
+      }
+
+      const checkedCount =
+        (trackedStats?.checkedCount || 0) + (cartStats?.checkedCount || 0);
+      const updatedPricesCount =
+        (trackedStats?.updatedPricesCount || 0) + (cartStats?.updatedPricesCount || 0);
+      const brokenCount =
+        (trackedStats?.brokenCount || 0) + (cartStats?.brokenCount || 0);
+
+      return sendJson(res, 200, {
+        ok: true,
+        checkedAt,
+        checkedCount,
+        updatedPricesCount,
+        brokenCount,
+        trackedStats,
+        cartStats,
+        items: listTrackedItems(),
+        carts: listCarts(),
+        cart: body.cartId ? getCartById(Number(body.cartId)) : null,
+      });
     }
 
     // 1. Metadata de tiendas y configuración
@@ -586,6 +658,21 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, { item });
       }
 
+      if (action === "stock" && method === "POST") {
+        const body = await readJsonBody(req);
+        if (!body.store) {
+          return sendJson(res, 400, { error: "Falta store" });
+        }
+        const item = setTrackedStoreStockStatus(
+          itemId,
+          body.store,
+          body.stockStatus || "out_of_stock",
+          body.storeZone || ""
+        );
+        if (!item) return sendJson(res, 404, { error: "Snapshot de tienda no encontrado" });
+        return sendJson(res, 200, { item });
+      }
+
       if (action === "pin" && method === "POST") {
         const body = await readJsonBody(req);
         if (!body.product) {
@@ -690,6 +777,27 @@ const server = http.createServer(async (req, res) => {
         const payload = body.product || body.rawContent || "";
         const resUpdate = updateCartItemLiderOffer(cartId, itemId, payload);
         return sendJson(res, 200, { ...resUpdate, carts: listCarts() });
+      }
+
+      if (itemAction === "stock" && method === "POST") {
+        const body = await readJsonBody(req);
+        const cart = setCartItemStoreStockStatus(cartId, itemId, {
+          store: body.store,
+          externalId: body.externalId,
+          stockStatus: body.stockStatus || "out_of_stock",
+          storeZone: body.storeZone || "",
+        });
+        return sendJson(res, 200, { cart, carts: listCarts() });
+      }
+
+      if (itemAction === "recheck" && method === "POST") {
+        const resRecheck = await recheckCartLinksAndPrices(cartId, itemId);
+        return sendJson(res, 200, {
+          ok: true,
+          ...resRecheck,
+          cart: getCartById(cartId),
+          carts: listCarts(),
+        });
       }
     }
 

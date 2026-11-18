@@ -12,6 +12,7 @@ import {
   normalizeText,
   parseBundle,
 } from "./normalizer.mjs";
+import { recheckLiveProductOffer } from "./scrapers.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const DATA_DIR =
@@ -124,6 +125,12 @@ if (!snapCols.some((c) => c.name === "stock_status")) {
 }
 if (!snapCols.some((c) => c.name === "store_zone")) {
   db.exec("ALTER TABLE price_snapshots ADD COLUMN store_zone TEXT NOT NULL DEFAULT '';");
+}
+if (!snapCols.some((c) => c.name === "last_verified_at")) {
+  db.exec("ALTER TABLE price_snapshots ADD COLUMN last_verified_at TEXT;");
+}
+if (!snapCols.some((c) => c.name === "link_status")) {
+  db.exec("ALTER TABLE price_snapshots ADD COLUMN link_status TEXT NOT NULL DEFAULT 'ok';");
 }
 
 if (getSetting("auto_interval_minutes") === null) {
@@ -288,14 +295,19 @@ export function insertSnapshot({
   const stockStatus =
     product.stockStatus || (inStockInt === 0 ? "out_of_stock" : "in_stock");
   const storeZone = String(product.storeZone || "").trim();
+  const lastVerifiedAt = product.lastVerifiedAt || recordedAt;
+  const linkStatus =
+    product.store === "lider" || product.store === "unimarc" || product.store === "tottus"
+      ? "protected"
+      : product.linkStatus || "ok";
 
   db.prepare(
     `INSERT INTO price_snapshots (
       tracked_item_id, pinned_product_id, store, external_id, product_name,
       brand, price, list_price, member_price, unit_price, effective_unit_price,
       unit, price_per_100, format_label, promo_text, product_url, image_url,
-      in_stock, stock_status, store_zone, recorded_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      in_stock, stock_status, store_zone, last_verified_at, link_status, recorded_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).run(
     Number(trackedItemId),
     pinnedProductId ? Number(pinnedProductId) : null,
@@ -317,6 +329,8 @@ export function insertSnapshot({
     inStockInt,
     stockStatus,
     storeZone,
+    lastVerifiedAt,
+    linkStatus,
     recordedAt
   );
 
@@ -376,11 +390,16 @@ export function touchOrInsertSnapshot({
     const nextUrl = product.url || latest.product_url || "";
     const nextImg = product.imageUrl || latest.image_url || "";
     const nextPinnedId = pinnedProductId ? Number(pinnedProductId) : latest.pinned_product_id;
+    const nextVerifiedAt = product.lastVerifiedAt || recordedAt;
+    const nextLinkStatus =
+      product.store === "lider" || product.store === "unimarc" || product.store === "tottus"
+        ? "protected"
+        : product.linkStatus || latest.link_status || "ok";
     db.prepare(
       `UPDATE price_snapshots
-       SET recorded_at = ?, product_url = ?, image_url = ?, pinned_product_id = ?, store_zone = ?
+       SET recorded_at = ?, product_url = ?, image_url = ?, pinned_product_id = ?, store_zone = ?, last_verified_at = ?, link_status = ?
        WHERE id = ?`
-    ).run(recordedAt, nextUrl, nextImg, nextPinnedId, nextStoreZone, latest.id);
+    ).run(recordedAt, nextUrl, nextImg, nextPinnedId, nextStoreZone, nextVerifiedAt, nextLinkStatus, latest.id);
 
     db.prepare("UPDATE tracked_items SET last_checked_at = ? WHERE id = ?").run(
       recordedAt,
@@ -391,6 +410,30 @@ export function touchOrInsertSnapshot({
 
   insertSnapshot({ trackedItemId, pinnedProductId, product, recordedAt });
   return { inserted: true };
+}
+
+export function setTrackedStoreStockStatus(trackedItemId, store, stockStatus, storeZone = "") {
+  const latest = db
+    .prepare(
+      `SELECT * FROM price_snapshots
+       WHERE tracked_item_id = ? AND store = ?
+       ORDER BY recorded_at DESC, id DESC LIMIT 1`
+    )
+    .get(Number(trackedItemId), store);
+  if (!latest) return null;
+
+  const isOut = stockStatus === "out_of_stock";
+  const inStockInt = isOut ? 0 : 1;
+  const cleanStatus = isOut ? "out_of_stock" : stockStatus || "in_stock";
+  const cleanZone = String(storeZone || latest.store_zone || (cleanStatus === "in_stock" ? "Confirmado" : "")).trim();
+
+  db.prepare(
+    `UPDATE price_snapshots
+     SET in_stock = ?, stock_status = ?, store_zone = ?
+     WHERE id = ?`
+  ).run(inStockInt, cleanStatus, cleanZone, latest.id);
+
+  return getTrackedItemById(trackedItemId);
 }
 
 /**
@@ -559,6 +602,13 @@ export function enrichTrackedItemWithStats(item) {
         : latest.effective_unit_price || latest.unit_price;
     const packageUnitPrice = promoUnitPrice || latest.price;
 
+    const rawInStock = latest.in_stock !== 0 && latest.stock_status !== "out_of_stock";
+    const normStockStatus = rawInStock ? "in_stock" : "out_of_stock";
+    const normLinkStatus =
+      latest.link_status === "broken" && (store === "lider" || store === "unimarc" || store === "tottus")
+        ? "protected"
+        : latest.link_status || (store === "lider" || store === "unimarc" || store === "tottus" ? "protected" : "ok");
+
     latestByStore[store] = {
       ...latest,
       product_url: normalizeProductUrl(latest.product_url, store),
@@ -576,9 +626,11 @@ export function enrichTrackedItemWithStats(item) {
       nutrition_seals: nut.nutritionSeals || [],
       inferred_category: nut.inferredCategory || inferProductCategory(latest.product_name),
       price_range_pct: priceRangePct,
-      in_stock: latest.in_stock !== 0 && latest.stock_status !== "out_of_stock",
-      stock_status: latest.stock_status || (latest.in_stock === 0 ? "out_of_stock" : "in_stock"),
+      in_stock: rawInStock,
+      stock_status: normStockStatus,
       store_zone: latest.store_zone || "",
+      last_verified_at: latest.last_verified_at || latest.recorded_at || null,
+      link_status: normLinkStatus,
       is_pure: purity.isPure,
       is_blend: purity.isBlend,
       purity_warning: purity.purityWarning,
@@ -611,8 +663,15 @@ export function enrichTrackedItemWithStats(item) {
   }
 
   const activeLatest = Object.values(latestByStore);
-  const inStockPool = activeLatest.filter((s) => s.in_stock !== false && s.stock_status !== "out_of_stock");
-  const stockPool = inStockPool.length > 0 ? inStockPool : activeLatest;
+  // Priorizar estrictamente stock confirmado (in_stock) sobre unverified_zone (Tottus sin comuna) y out_of_stock
+  const verifiedPool = activeLatest.filter(
+    (s) => s.in_stock !== false && s.stock_status === "in_stock"
+  );
+  const notOutPool = activeLatest.filter(
+    (s) => s.in_stock !== false && s.stock_status !== "out_of_stock"
+  );
+  const stockPool =
+    verifiedPool.length > 0 ? verifiedPool : notOutPool.length > 0 ? notOutPool : activeLatest;
   const purePool = stockPool.filter((s) => s.is_pure !== false);
   const candidatePool = purePool.length > 0 ? purePool : stockPool;
 
@@ -895,5 +954,108 @@ export function calculatePersonalIpc() {
     itemChanges,
     topIncreases,
     topDecreases,
+  };
+}
+
+export async function recheckTrackedLinksAndPrices(trackedItemId = null) {
+  const checkedAt = new Date().toISOString();
+  const rows = trackedItemId
+    ? db.prepare("SELECT * FROM tracked_items WHERE id = ?").all(Number(trackedItemId))
+    : db.prepare("SELECT * FROM tracked_items ORDER BY id ASC").all();
+
+  let checkedCount = 0;
+  let updatedPricesCount = 0;
+  let brokenCount = 0;
+
+  for (const row of rows) {
+    const item = enrichTrackedItemWithStats(row);
+    const storeEntries = Object.entries(item.latestByStore || {});
+    await Promise.all(
+      storeEntries.map(async ([store, snap]) => {
+        if (!snap || !snap.id) return;
+        const qtyExtracted = extractQuantityFromText(
+          `${snap.format_label || ""} ${snap.product_name || ""}`,
+          snap.unit || item.expected_unit || "un"
+        );
+        const baseAmount =
+          qtyExtracted?.baseAmount > 0
+            ? qtyExtracted.baseAmount
+            : snap.unit_price > 0
+            ? Number((snap.price / snap.unit_price).toFixed(3))
+            : 1;
+
+        const res = await recheckLiveProductOffer(
+          {
+            store,
+            name: snap.product_name,
+            externalId: snap.external_id,
+            sku: snap.external_id,
+            url: snap.product_url,
+            price: snap.price,
+            listPrice: snap.list_price,
+            promoText: snap.promo_text,
+            unit: snap.unit || item.expected_unit || "un",
+            unitPrice: snap.unit_price,
+            effectiveUnitPrice: snap.effective_unit_price,
+            baseAmount,
+            formatLabel: snap.format_label || "",
+            inStock: snap.in_stock,
+            stockStatus: snap.stock_status,
+            linkStatus: snap.link_status,
+          },
+          { force: true }
+        );
+
+        checkedCount++;
+        const p = res.product;
+        if (res.linkStatus === "broken") brokenCount++;
+        if (res.priceChanged) updatedPricesCount++;
+
+        const nextPrice = Math.round(p.price || snap.price);
+        const nextListPrice = p.listPrice ? Math.round(p.listPrice) : null;
+        const nextUnitPrice = Math.round(
+          p.unitPrice || (baseAmount > 0 ? nextPrice / baseAmount : snap.unit_price)
+        );
+        const nextEffUnit = Math.round(p.effectiveUnitPrice || nextUnitPrice);
+        const nextPromo = p.promoText || null;
+        const nextUrl = p.url || snap.product_url || "";
+        const nextInStock = p.inStock === false || p.stockStatus === "out_of_stock" ? 0 : 1;
+        const nextStockStatus = nextInStock === 0 ? "out_of_stock" : "in_stock";
+        const nextLinkStatus =
+          store === "lider" || store === "unimarc" || store === "tottus"
+            ? "protected"
+            : res.linkStatus || "ok";
+
+        db.prepare(
+          `UPDATE price_snapshots
+           SET price = ?, list_price = ?, unit_price = ?, effective_unit_price = ?,
+               promo_text = ?, product_url = ?, in_stock = ?, stock_status = ?,
+               last_verified_at = ?, link_status = ?
+           WHERE id = ?`
+        ).run(
+          nextPrice,
+          nextListPrice,
+          nextUnitPrice,
+          nextEffUnit,
+          nextPromo,
+          nextUrl,
+          nextInStock,
+          nextStockStatus,
+          res.verifiedAt || checkedAt,
+          nextLinkStatus,
+          snap.id
+        );
+      })
+    );
+
+    db.prepare("UPDATE tracked_items SET last_checked_at = ? WHERE id = ?").run(checkedAt, row.id);
+  }
+
+  return {
+    checkedCount,
+    updatedPricesCount,
+    brokenCount,
+    checkedAt,
+    items: listTrackedItems(),
   };
 }
